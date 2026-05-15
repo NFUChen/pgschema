@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"github.com/pgplex/pgschema/cmd/config"
 	"github.com/pgplex/pgschema/cmd/util"
@@ -863,15 +864,20 @@ func runPlanMultiSchema(cmd *cobra.Command, cfg *config.ResolvedConfig) error {
 		return fmt.Errorf("failed to process desired state schema file: %w", err)
 	}
 
+	totalSchemas := len(schemas)
+
 	// Phase 1: Fetch current state IR for all schemas concurrently.
 	// Each schema inspects the target database independently, so these can run in parallel.
+	fmt.Fprintf(os.Stderr, "\nInspecting current state for %d schemas...\n", totalSchemas)
+
 	type currentStateResult struct {
 		schemaIR    *ir.IR
 		fingerprint *fingerprint.SchemaFingerprint
 		err         error
 	}
-	currentStates := make([]currentStateResult, len(schemas))
+	currentStates := make([]currentStateResult, totalSchemas)
 
+	var completed atomic.Int32
 	var wg sync.WaitGroup
 	for idx, schemaName := range schemas {
 		wg.Add(1)
@@ -880,22 +886,29 @@ func runPlanMultiSchema(cmd *cobra.Command, cfg *config.ResolvedConfig) error {
 			schemaIR, fetchErr := util.GetIRFromDatabase(planHost, planPort, planDB, planUser, finalPassword, finalSSLMode, schema, "pgschema", ignoreConfig)
 			if fetchErr != nil {
 				currentStates[i] = currentStateResult{err: fmt.Errorf("failed to get current state from database: %w", fetchErr)}
+				n := completed.Add(1)
+				fmt.Fprintf(os.Stderr, "  [%d/%d] %s (error)\n", n, totalSchemas, schema)
 				return
 			}
 			fp, fpErr := fingerprint.ComputeFingerprint(schemaIR, schema)
 			if fpErr != nil {
 				currentStates[i] = currentStateResult{err: fmt.Errorf("failed to compute source fingerprint: %w", fpErr)}
+				n := completed.Add(1)
+				fmt.Fprintf(os.Stderr, "  [%d/%d] %s (error)\n", n, totalSchemas, schema)
 				return
 			}
 			currentStates[i] = currentStateResult{schemaIR: schemaIR, fingerprint: fp}
+			n := completed.Add(1)
+			fmt.Fprintf(os.Stderr, "  [%d/%d] %s\n", n, totalSchemas, schema)
 		}(idx, schemaName)
 	}
 	wg.Wait()
 
 	// Phase 2: For each schema, apply desired state (sequential — provider is stateful),
 	// inspect desired state, generate diff using pre-fetched current state.
+	fmt.Fprintf(os.Stderr, "\nGenerating migration plans...\n")
 	for idx, schemaName := range schemas {
-		fmt.Fprintf(os.Stderr, "\n── Schema: %s ──────────────────────\n", schemaName)
+		fmt.Fprintf(os.Stderr, "\n── Schema: %s [%d/%d] ──────────────────────\n", schemaName, idx+1, totalSchemas)
 
 		// Check if current state fetch failed.
 		cs := currentStates[idx]
