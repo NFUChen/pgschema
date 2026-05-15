@@ -773,7 +773,7 @@ func runPlanMultiSchema(cmd *cobra.Command, cfg *config.ResolvedConfig) error {
 		return err
 	}
 
-	multiPlan := plan.NewPlan()
+	plan := plan.NewPlan()
 	var hasErrors bool
 
 	for _, schemaName := range schemas {
@@ -816,7 +816,7 @@ func runPlanMultiSchema(cmd *cobra.Command, cfg *config.ResolvedConfig) error {
 		// visibility even when only file outputs are configured.
 		fmt.Fprintln(os.Stderr, migrationPlan.HumanColored(!planNoColor))
 
-		multiPlan.AddSchema(schemaName, migrationPlan)
+		plan.AddSchema(schemaName, migrationPlan)
 	}
 
 	// Check if debug flag is set
@@ -824,12 +824,12 @@ func runPlanMultiSchema(cmd *cobra.Command, cfg *config.ResolvedConfig) error {
 
 	// Write combined output for all schemas
 	for _, output := range outputs {
-		if err := processOutput(multiPlan, output, debug); err != nil {
+		if err := processOutput(plan, output, debug); err != nil {
 			return err
 		}
 	}
 
-	fmt.Fprintln(os.Stderr, "\n"+multiPlan.SummaryString())
+	fmt.Fprintln(os.Stderr, "\n"+plan.SummaryString())
 
 	if hasErrors {
 		return fmt.Errorf("one or more schemas had errors")
