@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/pgplex/pgschema/cmd/config"
 	"github.com/pgplex/pgschema/cmd/util"
@@ -348,6 +349,53 @@ func GenerateSchemaPlan(config *PlanConfig, provider postgres.DesiredStateProvid
 	// because that's where objects were created. We need to replace these with the target
 	// schema name (e.g., "public") so that generated DDL references the correct schema.
 	// Without this normalization, DDL would reference non-existent temporary schemas and fail.
+	if schemaToInspect != config.Schema {
+		normalizeSchemaNames(desiredStateIR, schemaToInspect, config.Schema)
+	}
+
+	// Generate diff (current -> desired) using IR directly
+	diffs := diff.GenerateMigration(currentStateIR, desiredStateIR, config.Schema)
+
+	// Create schema plan from diffs with fingerprint
+	schemaPlan := plan.NewSchemaPlanWithFingerprint(diffs, sourceFingerprint)
+
+	return schemaPlan, nil
+}
+
+// generateSchemaPlanWithCurrentState generates a migration plan using pre-fetched current state.
+// This variant is used by runPlanMultiSchema where current state IR and fingerprints are fetched
+// concurrently for all schemas, then desired state operations run sequentially through the shared provider.
+func generateSchemaPlanWithCurrentState(config *PlanConfig, provider postgres.DesiredStateProvider, desiredState string, ignoreConfig *ir.IgnoreConfig, currentStateIR *ir.IR, sourceFingerprint *fingerprint.SchemaFingerprint) (*plan.SchemaPlan, error) {
+	ctx := context.Background()
+
+	// Apply desired state SQL to the provider (embedded postgres or external database)
+	if err := provider.ApplySchema(ctx, config.Schema, desiredState); err != nil {
+		return nil, fmt.Errorf("failed to apply desired state: %w", err)
+	}
+
+	// Inspect the provider database to get desired state IR
+	providerHost, providerPort, providerDB, providerUsername, providerPassword := provider.GetConnectionDetails()
+
+	schemaToInspect := provider.GetSchemaName()
+	if schemaToInspect == "" {
+		schemaToInspect = config.Schema
+	}
+
+	// For embedded postgres, always use "disable" since it starts without SSL configured.
+	// For external plan databases, use the configured PlanDBSSLMode (defaulting to "prefer").
+	providerSSLMode := "disable"
+	if config.PlanDBHost != "" {
+		providerSSLMode = config.PlanDBSSLMode
+		if providerSSLMode == "" {
+			providerSSLMode = "prefer"
+		}
+	}
+	desiredStateIR, err := util.GetIRFromDatabase(providerHost, providerPort, providerDB, providerUsername, providerPassword, providerSSLMode, schemaToInspect, config.ApplicationName, ignoreConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get desired state: %w", err)
+	}
+
+	// Normalize schema names in the IR from temporary schema to target schema.
 	if schemaToInspect != config.Schema {
 		normalizeSchemaNames(desiredStateIR, schemaToInspect, config.Schema)
 	}
@@ -802,8 +850,60 @@ func runPlanMultiSchema(cmd *cobra.Command, cfg *config.ResolvedConfig) error {
 	}
 	defer provider.Stop()
 
-	for _, schemaName := range schemas {
+	// Load ignore configuration once (shared across all schemas).
+	ignoreConfig, err := util.LoadIgnoreFileWithStructure()
+	if err != nil {
+		return fmt.Errorf("failed to load .pgschemaignore: %w", err)
+	}
+
+	// Process desired state file once (shared across all schemas).
+	processor := include.NewProcessor(filepath.Dir(planFile))
+	desiredState, err := processor.ProcessFile(planFile)
+	if err != nil {
+		return fmt.Errorf("failed to process desired state schema file: %w", err)
+	}
+
+	// Phase 1: Fetch current state IR for all schemas concurrently.
+	// Each schema inspects the target database independently, so these can run in parallel.
+	type currentStateResult struct {
+		schemaIR    *ir.IR
+		fingerprint *fingerprint.SchemaFingerprint
+		err         error
+	}
+	currentStates := make([]currentStateResult, len(schemas))
+
+	var wg sync.WaitGroup
+	for idx, schemaName := range schemas {
+		wg.Add(1)
+		go func(i int, schema string) {
+			defer wg.Done()
+			schemaIR, fetchErr := util.GetIRFromDatabase(planHost, planPort, planDB, planUser, finalPassword, finalSSLMode, schema, "pgschema", ignoreConfig)
+			if fetchErr != nil {
+				currentStates[i] = currentStateResult{err: fmt.Errorf("failed to get current state from database: %w", fetchErr)}
+				return
+			}
+			fp, fpErr := fingerprint.ComputeFingerprint(schemaIR, schema)
+			if fpErr != nil {
+				currentStates[i] = currentStateResult{err: fmt.Errorf("failed to compute source fingerprint: %w", fpErr)}
+				return
+			}
+			currentStates[i] = currentStateResult{schemaIR: schemaIR, fingerprint: fp}
+		}(idx, schemaName)
+	}
+	wg.Wait()
+
+	// Phase 2: For each schema, apply desired state (sequential — provider is stateful),
+	// inspect desired state, generate diff using pre-fetched current state.
+	for idx, schemaName := range schemas {
 		fmt.Fprintf(os.Stderr, "\n── Schema: %s ──────────────────────\n", schemaName)
+
+		// Check if current state fetch failed.
+		cs := currentStates[idx]
+		if cs.err != nil {
+			fmt.Fprintf(os.Stderr, "Error for schema %s: %v\n", schemaName, cs.err)
+			hasErrors = true
+			continue
+		}
 
 		perSchemaConfig := &PlanConfig{
 			Host:            planHost,
@@ -823,7 +923,7 @@ func runPlanMultiSchema(cmd *cobra.Command, cfg *config.ResolvedConfig) error {
 			PlanDBSSLMode:   planDBSSLMode,
 		}
 
-		migrationPlan, err := GenerateSchemaPlan(perSchemaConfig, provider)
+		migrationPlan, err := generateSchemaPlanWithCurrentState(perSchemaConfig, provider, desiredState, ignoreConfig, cs.schemaIR, cs.fingerprint)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error for schema %s: %v\n", schemaName, err)
 			hasErrors = true
