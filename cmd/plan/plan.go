@@ -776,6 +776,32 @@ func runPlanMultiSchema(cmd *cobra.Command, cfg *config.ResolvedConfig) error {
 	plan := plan.NewPlan()
 	var hasErrors bool
 
+	// Create the desired state provider once and reuse it across all schemas.
+	// ApplySchema already resets state (drops/recreates temporary schema) between calls,
+	// so a single embedded postgres instance or external DB connection suffices.
+	sharedConfig := &PlanConfig{
+		Host:            planHost,
+		Port:            planPort,
+		DB:              planDB,
+		User:            planUser,
+		Password:        finalPassword,
+		File:            planFile,
+		ApplicationName: "pgschema",
+		SSLMode:         finalSSLMode,
+		PlanDBHost:      planDBHost,
+		PlanDBPort:      planDBPort,
+		PlanDBDatabase:  planDBDatabase,
+		PlanDBUser:      planDBUser,
+		PlanDBPassword:  finalPlanPassword,
+		PlanDBSSLMode:   planDBSSLMode,
+	}
+
+	provider, err := CreateDesiredStateProvider(sharedConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create desired state provider: %w", err)
+	}
+	defer provider.Stop()
+
 	for _, schemaName := range schemas {
 		fmt.Fprintf(os.Stderr, "\n── Schema: %s ──────────────────────\n", schemaName)
 
@@ -797,15 +823,7 @@ func runPlanMultiSchema(cmd *cobra.Command, cfg *config.ResolvedConfig) error {
 			PlanDBSSLMode:   planDBSSLMode,
 		}
 
-		provider, err := CreateDesiredStateProvider(perSchemaConfig)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error for schema %s: %v\n", schemaName, err)
-			hasErrors = true
-			continue
-		}
-
 		migrationPlan, err := GenerateSchemaPlan(perSchemaConfig, provider)
-		provider.Stop()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Error for schema %s: %v\n", schemaName, err)
 			hasErrors = true
