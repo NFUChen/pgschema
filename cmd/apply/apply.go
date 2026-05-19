@@ -42,6 +42,7 @@ var (
 
 	applySSLMode       string
 	applyPlanDBSSLMode string
+	applySchemasQuery  string
 )
 
 var ApplyCmd = &cobra.Command{
@@ -87,6 +88,9 @@ func init() {
 
 	// SSL mode flag
 	ApplyCmd.Flags().StringVar(&applySSLMode, "sslmode", "prefer", "SSL mode for database connection (disable, allow, prefer, require, verify-ca, verify-full) (env: PGSSLMODE)")
+
+	// Multi-schema flag
+	ApplyCmd.Flags().StringVar(&applySchemasQuery, "schemas-query", "", "SQL query returning schema names for multi-schema apply (e.g., \"SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'tenant_%'\")")
 
 	// Mark file and plan as mutually exclusive
 	ApplyCmd.MarkFlagsMutuallyExclusive("file", "plan")
@@ -270,10 +274,9 @@ func ApplyMigration(config *ApplyConfig, provider postgres.DesiredStateProvider)
 
 // RunApply executes the apply command logic. Exported for testing.
 func RunApply(cmd *cobra.Command, args []string) error {
-	cfg := config.Get()
-	if cfg != nil && cfg.Schemas != nil && cfg.Schemas.Query != "" &&
+	if applySchemasQuery != "" &&
 		!cmd.Flags().Changed("schema") && !cmd.Flags().Changed("plan") {
-		return runApplyMultiSchema(cmd, cfg)
+		return runApplyMultiSchema(cmd, applySchemasQuery)
 	}
 
 	// Validate that either --file or --plan is provided
@@ -539,7 +542,7 @@ func executeGroupIndividually(ctx context.Context, conn *sql.DB, group plan.Exec
 	return nil
 }
 
-func runApplyMultiSchema(cmd *cobra.Command, cfg *config.ResolvedConfig) error {
+func runApplyMultiSchema(cmd *cobra.Command, schemasQuery string) error {
 	// Apply plan DB environment variables (same as single-schema path)
 	util.ApplyPlanDBEnvVars(cmd, &applyPlanDBHost, &applyPlanDBDatabase, &applyPlanDBUser, &applyPlanDBPassword, &applyPlanDBPort, &applyPlanDBSSLMode)
 
@@ -569,7 +572,7 @@ func runApplyMultiSchema(cmd *cobra.Command, cfg *config.ResolvedConfig) error {
 		}
 	}
 
-	schemas, err := config.DiscoverSchemas(applyHost, applyPort, applyDB, applyUser, finalPassword, finalSSLMode, cfg.Schemas.Query)
+	schemas, err := config.DiscoverSchemas(applyHost, applyPort, applyDB, applyUser, finalPassword, finalSSLMode, schemasQuery)
 	if err != nil {
 		return err
 	}
@@ -703,6 +706,9 @@ func applyConfigToApply(cmd *cobra.Command) {
 	}
 	if !cmd.Flags().Changed("plan-sslmode") && cfg.PlanSSLMode != "" {
 		applyPlanDBSSLMode = cfg.PlanSSLMode
+	}
+	if !cmd.Flags().Changed("schemas-query") && cfg.Schemas != nil && cfg.Schemas.Query != "" {
+		applySchemasQuery = cfg.Schemas.Query
 	}
 }
 

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -198,4 +199,104 @@ func TestPlanCommandFileError(t *testing.T) {
 	if err == nil {
 		t.Error("Expected error when file doesn't exist, but got none")
 	}
+}
+
+func TestPlanCommand_SchemasQueryFlagDefined(t *testing.T) {
+	flag := PlanCmd.Flags().Lookup("schemas-query")
+	if flag == nil {
+		t.Fatal("Expected --schemas-query flag to be defined")
+	}
+	if flag.DefValue != "" {
+		t.Errorf("Expected default schemas-query to be empty, got %q", flag.DefValue)
+	}
+}
+
+func TestRunPlan_SchemasQueryFlagTriggersMultiSchema(t *testing.T) {
+	// When --schemas-query is provided via CLI flag, runPlan should enter
+	// the multi-schema path. We detect this by checking for the schema
+	// discovery connection error (since no real DB is available).
+	ResetFlags()
+	defer ResetFlags()
+
+	tmpDir := t.TempDir()
+	schemaPath := filepath.Join(tmpDir, "schema.sql")
+	os.WriteFile(schemaPath, []byte("CREATE TABLE t (id int);"), 0644)
+
+	planFile = schemaPath
+	planSchemasQuery = "SELECT schema_name FROM information_schema.schemata"
+	planDB = "testdb"
+	planUser = "testuser"
+
+	err := runPlan(PlanCmd, []string{})
+	if err == nil {
+		t.Fatal("Expected error from schema discovery (no DB), got nil")
+	}
+	// The error should come from DiscoverSchemas, not from single-schema path
+	if !containsAny(err.Error(), "schema discovery", "failed to connect") {
+		t.Errorf("Expected schema discovery error, got: %v", err)
+	}
+}
+
+func TestRunPlan_SchemasQueryConfigFallback(t *testing.T) {
+	// When --schemas-query is NOT set via CLI but config has [schemas] query,
+	// it should still enter multi-schema path via applyConfigToPlan merge.
+	ResetFlags()
+	defer ResetFlags()
+
+	tmpDir := t.TempDir()
+	schemaPath := filepath.Join(tmpDir, "schema.sql")
+	os.WriteFile(schemaPath, []byte("CREATE TABLE t (id int);"), 0644)
+
+	planFile = schemaPath
+	planDB = "testdb"
+	planUser = "testuser"
+
+	// Simulate what applyConfigToPlan does when config has schemas query
+	planSchemasQuery = "SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'tenant_%'"
+
+	err := runPlan(PlanCmd, []string{})
+	if err == nil {
+		t.Fatal("Expected error from schema discovery (no DB), got nil")
+	}
+	if !containsAny(err.Error(), "schema discovery", "failed to connect") {
+		t.Errorf("Expected schema discovery error, got: %v", err)
+	}
+}
+
+func TestRunPlan_SchemaFlagOverridesSchemasQuery(t *testing.T) {
+	// When --schema is explicitly set, it should NOT enter multi-schema path
+	// even if --schemas-query is provided.
+	ResetFlags()
+	defer ResetFlags()
+
+	tmpDir := t.TempDir()
+	schemaPath := filepath.Join(tmpDir, "schema.sql")
+	os.WriteFile(schemaPath, []byte("CREATE TABLE t (id int);"), 0644)
+
+	planFile = schemaPath
+	planSchemasQuery = "SELECT schema_name FROM information_schema.schemata"
+	planDB = "testdb"
+	planUser = "testuser"
+
+	// Mark --schema as explicitly changed
+	PlanCmd.Flags().Set("schema", "myschema")
+	defer PlanCmd.Flags().Set("schema", "public")
+
+	err := runPlan(PlanCmd, []string{})
+	if err == nil {
+		t.Fatal("Expected error (no DB connection), got nil")
+	}
+	// Should NOT contain schema discovery errors — it should go single-schema path
+	if containsAny(err.Error(), "schema discovery") {
+		t.Errorf("--schema flag should prevent multi-schema path, got: %v", err)
+	}
+}
+
+func containsAny(s string, substrs ...string) bool {
+	for _, sub := range substrs {
+		if strings.Contains(s, sub) {
+			return true
+		}
+	}
+	return false
 }

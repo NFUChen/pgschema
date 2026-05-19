@@ -586,3 +586,102 @@ func TestRunApply_PlanFlagSkipsMultiSchema(t *testing.T) {
 		t.Errorf("--plan flag should prevent entering multi-schema path, got: %v", err)
 	}
 }
+
+func TestApplyCommand_SchemasQueryFlagDefined(t *testing.T) {
+	flag := ApplyCmd.Flags().Lookup("schemas-query")
+	if flag == nil {
+		t.Fatal("Expected --schemas-query flag to be defined")
+	}
+	if flag.DefValue != "" {
+		t.Errorf("Expected default schemas-query to be empty, got %q", flag.DefValue)
+	}
+}
+
+func TestRunApply_SchemasQueryFlagTriggersMultiSchema(t *testing.T) {
+	// When --schemas-query is set via CLI and --file is provided but no --plan,
+	// RunApply should enter multi-schema path. Without a real DB, this
+	// results in a schema discovery connection error.
+	applyDB = "testdb"
+	applyUser = "testuser"
+	applyFile = "schema.sql"
+	applyPlan = ""
+	applySchemasQuery = "SELECT schema_name FROM information_schema.schemata"
+	config.SetResolved(nil)
+	defer func() {
+		applyDB = ""
+		applyUser = ""
+		applyFile = ""
+		applyPlan = ""
+		applySchemasQuery = ""
+	}()
+
+	err := RunApply(ApplyCmd, []string{})
+	if err == nil {
+		t.Fatal("Expected error from schema discovery (no DB), got nil")
+	}
+	if !strings.Contains(err.Error(), "schema discovery") && !strings.Contains(err.Error(), "failed to connect") {
+		t.Errorf("Expected schema discovery error, got: %v", err)
+	}
+}
+
+func TestRunApply_SchemasQueryCLIWithPlanFlagSkipsMultiSchema(t *testing.T) {
+	// Even when --schemas-query is set, if --plan is also provided,
+	// it should NOT enter multi-schema path.
+	tmpDir := t.TempDir()
+	planPath := filepath.Join(tmpDir, "plan.json")
+	planJSON := `{"version":"0.0.0","pgschema_version":"test","created_at":"2024-01-01T00:00:00Z","transaction":true,"summary":{"total":0,"add":0,"change":0,"destroy":0,"by_type":{}},"diffs":[]}`
+	os.WriteFile(planPath, []byte(planJSON), 0644)
+
+	applyDB = "testdb"
+	applyUser = "testuser"
+	applyFile = ""
+	applyPlan = planPath
+	applySchemasQuery = "SELECT schema_name FROM information_schema.schemata"
+	config.SetResolved(nil)
+	defer func() {
+		applyDB = ""
+		applyUser = ""
+		applyFile = ""
+		applyPlan = ""
+		applySchemasQuery = ""
+	}()
+
+	ApplyCmd.Flags().Set("plan", planPath)
+	defer ApplyCmd.Flags().Set("plan", "")
+
+	err := RunApply(ApplyCmd, []string{})
+
+	if err != nil && strings.Contains(err.Error(), "--file is required for multi-schema apply") {
+		t.Errorf("--plan flag should prevent entering multi-schema path even with --schemas-query, got: %v", err)
+	}
+}
+
+func TestRunApply_SchemasQueryConfigFallback(t *testing.T) {
+	// When --schemas-query is NOT set via CLI but config has [schemas] query,
+	// applyConfigToApply should populate applySchemasQuery and trigger multi-schema.
+	cfg := &config.ResolvedConfig{
+		Schemas: &config.SchemasConfig{Query: "SELECT schema_name FROM information_schema.schemata"},
+	}
+	config.SetResolved(cfg)
+	defer config.SetResolved(nil)
+
+	applyDB = "testdb"
+	applyUser = "testuser"
+	applyFile = "schema.sql"
+	applyPlan = ""
+	applySchemasQuery = ""
+	defer func() {
+		applyDB = ""
+		applyUser = ""
+		applyFile = ""
+		applyPlan = ""
+		applySchemasQuery = ""
+	}()
+
+	// Simulate PreRunE calling applyConfigToApply
+	applyConfigToApply(ApplyCmd)
+
+	if applySchemasQuery != "SELECT schema_name FROM information_schema.schemata" {
+		t.Errorf("Expected applySchemasQuery to be set from config, got %q", applySchemasQuery)
+	}
+}
