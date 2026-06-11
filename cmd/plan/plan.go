@@ -41,8 +41,9 @@ var (
 	planDBUser     string
 	planDBPassword string
 
-	planSSLMode   string
-	planDBSSLMode string
+	planSSLMode      string
+	planDBSSLMode    string
+	planSchemasQuery string
 )
 
 var PlanCmd = &cobra.Command{
@@ -86,6 +87,8 @@ func init() {
 	PlanCmd.Flags().StringVar(&outputSQL, "output-sql", "", "Output SQL format to stdout or file path")
 	PlanCmd.Flags().BoolVar(&planNoColor, "no-color", false, "Disable colored output")
 
+	// Multi-schema flag
+	PlanCmd.Flags().StringVar(&planSchemasQuery, "schemas-query", "", "SQL query returning schema names for multi-schema plan (e.g., \"SELECT schema_name FROM information_schema.schemata WHERE schema_name LIKE 'tenant_%'\")")
 }
 
 func runPlan(cmd *cobra.Command, args []string) error {
@@ -93,9 +96,8 @@ func runPlan(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("--file is required (provide via flag, config file, or environment)")
 	}
 
-	cfg := config.Get()
-	if cfg != nil && cfg.Schemas != nil && cfg.Schemas.Query != "" && !cmd.Flags().Changed("schema") {
-		return runPlanMultiSchema(cmd, cfg)
+	if planSchemasQuery != "" && !cmd.Flags().Changed("schema") {
+		return runPlanMultiSchema(cmd, planSchemasQuery)
 	}
 
 	// Apply environment variables to plan database flags
@@ -801,7 +803,7 @@ func newSameSchemaQualifierStripper(schema string) func(string) string {
 	}
 }
 
-func runPlanMultiSchema(cmd *cobra.Command, cfg *config.ResolvedConfig) error {
+func runPlanMultiSchema(cmd *cobra.Command, schemasQuery string) error {
 	// Apply plan DB environment variables (same as single-schema path)
 	util.ApplyPlanDBEnvVars(cmd, &planDBHost, &planDBDatabase, &planDBUser, &planDBPassword, &planDBPort, &planDBSSLMode)
 
@@ -831,7 +833,7 @@ func runPlanMultiSchema(cmd *cobra.Command, cfg *config.ResolvedConfig) error {
 		}
 	}
 
-	schemas, err := config.DiscoverSchemas(planHost, planPort, planDB, planUser, finalPassword, finalSSLMode, cfg.Schemas.Query)
+	schemas, err := config.DiscoverSchemas(planHost, planPort, planDB, planUser, finalPassword, finalSSLMode, schemasQuery)
 	if err != nil {
 		return err
 	}
@@ -1052,6 +1054,9 @@ func applyConfigToPlan(cmd *cobra.Command) {
 	if !cmd.Flags().Changed("output-sql") && cfg.OutputSQL != "" {
 		outputSQL = cfg.OutputSQL
 	}
+	if !cmd.Flags().Changed("schemas-query") && cfg.Schemas != nil && cfg.Schemas.Query != "" {
+		planSchemasQuery = cfg.Schemas.Query
+	}
 }
 
 // ResetFlags resets all global flag variables to their default values for testing
@@ -1074,4 +1079,5 @@ func ResetFlags() {
 	planDBPassword = ""
 	planSSLMode = "prefer"
 	planDBSSLMode = "prefer"
+	planSchemasQuery = ""
 }
