@@ -7,7 +7,10 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"sync/atomic"
 
+	"github.com/pgplex/pgschema/cmd/config"
 	"github.com/pgplex/pgschema/cmd/util"
 	"github.com/pgplex/pgschema/internal/diff"
 	"github.com/pgplex/pgschema/internal/fingerprint"
@@ -48,7 +51,10 @@ var PlanCmd = &cobra.Command{
 	Long:         "Generate a migration plan to apply a desired schema state to a target database schema. Compares the desired state (from --file) with the current state of a specific schema (specified by --schema, defaults to 'public').",
 	RunE:         runPlan,
 	SilenceUsage: true,
-	PreRunE:      util.PreRunEWithEnvVarsAndConnection(&planDB, &planUser, &planHost, &planPort),
+	PreRunE: func(cmd *cobra.Command, args []string) error {
+		applyConfigToPlan(cmd)
+		return util.PreRunEWithEnvVarsAndConnection(&planDB, &planUser, &planHost, &planPort)(cmd, args)
+	},
 }
 
 func init() {
@@ -80,10 +86,18 @@ func init() {
 	PlanCmd.Flags().StringVar(&outputSQL, "output-sql", "", "Output SQL format to stdout or file path")
 	PlanCmd.Flags().BoolVar(&planNoColor, "no-color", false, "Disable colored output")
 
-	PlanCmd.MarkFlagRequired("file")
 }
 
 func runPlan(cmd *cobra.Command, args []string) error {
+	if planFile == "" {
+		return fmt.Errorf("--file is required (provide via flag, config file, or environment)")
+	}
+
+	cfg := config.Get()
+	if cfg != nil && cfg.Schemas != nil && cfg.Schemas.Query != "" && !cmd.Flags().Changed("schema") {
+		return runPlanMultiSchema(cmd, cfg)
+	}
+
 	// Apply environment variables to plan database flags
 	util.ApplyPlanDBEnvVars(cmd, &planDBHost, &planDBDatabase, &planDBUser, &planDBPassword, &planDBPort, &planDBSSLMode)
 
@@ -153,11 +167,15 @@ func runPlan(cmd *cobra.Command, args []string) error {
 	}
 	defer provider.Stop()
 
-	// Generate plan
-	migrationPlan, err := GeneratePlan(config, provider)
+	// Generate per-schema plan
+	schemaPlan, err := GenerateSchemaPlan(config, provider)
 	if err != nil {
 		return err
 	}
+
+	// Wrap in unified Plan
+	migrationPlan := plan.NewPlan()
+	migrationPlan.AddSchema(config.Schema, schemaPlan)
 
 	// Determine which outputs to generate
 	outputs, err := determineOutputs()
@@ -165,9 +183,12 @@ func runPlan(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
+	// Check if debug flag is set
+	debug, _ := cmd.Root().PersistentFlags().GetBool("debug")
+
 	// Process each output
 	for _, output := range outputs {
-		if err := processOutput(migrationPlan, output, cmd); err != nil {
+		if err := processOutput(migrationPlan, output, debug); err != nil {
 			return err
 		}
 	}
@@ -263,10 +284,10 @@ func CreateEmbeddedPostgresForPlan(config *PlanConfig, pgVersion postgres.Postgr
 	return embeddedPG, nil
 }
 
-// GeneratePlan generates a migration plan from configuration.
+// GenerateSchemaPlan generates a migration plan from configuration.
 // The caller must provide a non-nil provider instance for validating the desired state schema.
 // The caller is responsible for managing the provider lifecycle (creation and cleanup).
-func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*plan.Plan, error) {
+func GenerateSchemaPlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*plan.SchemaPlan, error) {
 	// Load ignore configuration
 	ignoreConfig, err := util.LoadIgnoreFileWithStructure()
 	if err != nil {
@@ -336,10 +357,57 @@ func GeneratePlan(config *PlanConfig, provider postgres.DesiredStateProvider) (*
 	// Generate diff (current -> desired) using IR directly
 	diffs := diff.GenerateMigration(currentStateIR, desiredStateIR, config.Schema)
 
-	// Create plan from diffs with fingerprint
-	migrationPlan := plan.NewPlanWithFingerprint(diffs, sourceFingerprint)
+	// Create schema plan from diffs with fingerprint
+	schemaPlan := plan.NewSchemaPlanWithFingerprint(diffs, sourceFingerprint)
 
-	return migrationPlan, nil
+	return schemaPlan, nil
+}
+
+// generateSchemaPlanWithCurrentState generates a migration plan using pre-fetched current state.
+// This variant is used by runPlanMultiSchema where current state IR and fingerprints are fetched
+// concurrently for all schemas, then desired state operations run sequentially through the shared provider.
+func generateSchemaPlanWithCurrentState(config *PlanConfig, provider postgres.DesiredStateProvider, desiredState string, ignoreConfig *ir.IgnoreConfig, currentStateIR *ir.IR, sourceFingerprint *fingerprint.SchemaFingerprint) (*plan.SchemaPlan, error) {
+	ctx := context.Background()
+
+	// Apply desired state SQL to the provider (embedded postgres or external database)
+	if err := provider.ApplySchema(ctx, config.Schema, desiredState); err != nil {
+		return nil, fmt.Errorf("failed to apply desired state: %w", err)
+	}
+
+	// Inspect the provider database to get desired state IR
+	providerHost, providerPort, providerDB, providerUsername, providerPassword := provider.GetConnectionDetails()
+
+	schemaToInspect := provider.GetSchemaName()
+	if schemaToInspect == "" {
+		schemaToInspect = config.Schema
+	}
+
+	// For embedded postgres, always use "disable" since it starts without SSL configured.
+	// For external plan databases, use the configured PlanDBSSLMode (defaulting to "prefer").
+	providerSSLMode := "disable"
+	if config.PlanDBHost != "" {
+		providerSSLMode = config.PlanDBSSLMode
+		if providerSSLMode == "" {
+			providerSSLMode = "prefer"
+		}
+	}
+	desiredStateIR, err := util.GetIRFromDatabase(providerHost, providerPort, providerDB, providerUsername, providerPassword, providerSSLMode, schemaToInspect, config.ApplicationName, ignoreConfig)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get desired state: %w", err)
+	}
+
+	// Normalize schema names in the IR from temporary schema to target schema.
+	if schemaToInspect != config.Schema {
+		normalizeSchemaNames(desiredStateIR, schemaToInspect, config.Schema)
+	}
+
+	// Generate diff (current -> desired) using IR directly
+	diffs := diff.GenerateMigration(currentStateIR, desiredStateIR, config.Schema)
+
+	// Create schema plan from diffs with fingerprint
+	schemaPlan := plan.NewSchemaPlanWithFingerprint(diffs, sourceFingerprint)
+
+	return schemaPlan, nil
 }
 
 // outputSpec represents a single output specification
@@ -388,36 +456,31 @@ func determineOutputs() ([]outputSpec, error) {
 	return outputs, nil
 }
 
-// processOutput writes the plan in the specified format to the target destination
-func processOutput(migrationPlan *plan.Plan, output outputSpec, cmd *cobra.Command) error {
+// processOutput writes a plan.Plan in the specified
+// format to the target destination.
+func processOutput(p *plan.Plan, output outputSpec, debug bool) error {
 	var content string
 	var err error
 
-	// Generate content based on format
 	switch output.format {
 	case "human":
-		// For human format, use colored output when writing to stdout, unless explicitly disabled
 		useColor := output.target == "stdout" && !planNoColor
-		content = migrationPlan.HumanColored(useColor)
+		content = p.HumanColored(useColor)
 	case "json":
-		// Check if debug flag is set on the root command
-		debug, _ := cmd.Root().PersistentFlags().GetBool("debug")
-		content, err = migrationPlan.ToJSONWithDebug(debug)
+		content, err = p.ToJSONWithDebug(debug)
 		if err != nil {
 			return fmt.Errorf("failed to generate JSON output: %w", err)
 		}
 		content += "\n"
 	case "sql":
-		content = migrationPlan.ToSQL(plan.SQLFormatRaw)
+		content = p.ToSQL(plan.SQLFormatRaw)
 	default:
 		return fmt.Errorf("unknown output format: %s", output.format)
 	}
 
-	// Write to target
 	if output.target == "stdout" {
 		fmt.Print(content)
 	} else {
-		// Write to file
 		if err := os.WriteFile(output.target, []byte(content), 0644); err != nil {
 			return fmt.Errorf("failed to write %s output to %s: %w", output.format, output.target, err)
 		}
@@ -735,6 +798,259 @@ func newSameSchemaQualifierStripper(schema string) func(string) string {
 		s = funcPattern.ReplaceAllString(s, `${1}(`)
 		s = typePattern.ReplaceAllString(s, "::")
 		return s
+	}
+}
+
+func runPlanMultiSchema(cmd *cobra.Command, cfg *config.ResolvedConfig) error {
+	// Apply plan DB environment variables (same as single-schema path)
+	util.ApplyPlanDBEnvVars(cmd, &planDBHost, &planDBDatabase, &planDBUser, &planDBPassword, &planDBPort, &planDBSSLMode)
+
+	// Validate plan database flags if plan-host is provided
+	if err := util.ValidatePlanDBFlags(planDBHost, planDBDatabase, planDBUser); err != nil {
+		return err
+	}
+
+	finalPassword := planPassword
+	if finalPassword == "" {
+		if envPassword := os.Getenv("PGPASSWORD"); envPassword != "" {
+			finalPassword = envPassword
+		}
+	}
+	finalSSLMode := planSSLMode
+	if cmd == nil || !cmd.Flags().Changed("sslmode") {
+		if envSSLMode := os.Getenv("PGSSLMODE"); envSSLMode != "" {
+			finalSSLMode = envSSLMode
+		}
+	}
+
+	// Derive final plan database password
+	finalPlanPassword := planDBPassword
+	if finalPlanPassword == "" {
+		if envPassword := os.Getenv("PGSCHEMA_PLAN_PASSWORD"); envPassword != "" {
+			finalPlanPassword = envPassword
+		}
+	}
+
+	schemas, err := config.DiscoverSchemas(planHost, planPort, planDB, planUser, finalPassword, finalSSLMode, cfg.Schemas.Query)
+	if err != nil {
+		return err
+	}
+
+	if len(schemas) == 0 {
+		fmt.Fprintln(os.Stderr, "Warning: schema discovery query returned no schemas.")
+		return nil
+	}
+
+	outputs, err := determineOutputs()
+	if err != nil {
+		return err
+	}
+
+	plan := plan.NewPlan()
+	var hasErrors bool
+
+	// Create the desired state provider once and reuse it across all schemas.
+	// ApplySchema already resets state (drops/recreates temporary schema) between calls,
+	// so a single embedded postgres instance or external DB connection suffices.
+	sharedConfig := &PlanConfig{
+		Host:            planHost,
+		Port:            planPort,
+		DB:              planDB,
+		User:            planUser,
+		Password:        finalPassword,
+		File:            planFile,
+		ApplicationName: "pgschema",
+		SSLMode:         finalSSLMode,
+		PlanDBHost:      planDBHost,
+		PlanDBPort:      planDBPort,
+		PlanDBDatabase:  planDBDatabase,
+		PlanDBUser:      planDBUser,
+		PlanDBPassword:  finalPlanPassword,
+		PlanDBSSLMode:   planDBSSLMode,
+	}
+
+	provider, err := CreateDesiredStateProvider(sharedConfig)
+	if err != nil {
+		return fmt.Errorf("failed to create desired state provider: %w", err)
+	}
+	defer provider.Stop()
+
+	// Load ignore configuration once (shared across all schemas).
+	ignoreConfig, err := util.LoadIgnoreFileWithStructure()
+	if err != nil {
+		return fmt.Errorf("failed to load .pgschemaignore: %w", err)
+	}
+
+	// Process desired state file once (shared across all schemas).
+	processor := include.NewProcessor(filepath.Dir(planFile))
+	desiredState, err := processor.ProcessFile(planFile)
+	if err != nil {
+		return fmt.Errorf("failed to process desired state schema file: %w", err)
+	}
+
+	totalSchemas := len(schemas)
+
+	// Phase 1: Fetch current state IR for all schemas concurrently.
+	// Each schema inspects the target database independently, so these can run in parallel.
+	fmt.Fprintf(os.Stderr, "\nInspecting current state for %d schemas...\n", totalSchemas)
+
+	type currentStateResult struct {
+		schemaIR    *ir.IR
+		fingerprint *fingerprint.SchemaFingerprint
+		err         error
+	}
+	currentStates := make([]currentStateResult, totalSchemas)
+
+	var completed atomic.Int32
+	var wg sync.WaitGroup
+	for idx, schemaName := range schemas {
+		wg.Add(1)
+		go func(i int, schema string) {
+			defer wg.Done()
+			schemaIR, fetchErr := util.GetIRFromDatabase(planHost, planPort, planDB, planUser, finalPassword, finalSSLMode, schema, "pgschema", ignoreConfig)
+			if fetchErr != nil {
+				currentStates[i] = currentStateResult{err: fmt.Errorf("failed to get current state from database: %w", fetchErr)}
+				n := completed.Add(1)
+				fmt.Fprintf(os.Stderr, "  [%d/%d] %s (error)\n", n, totalSchemas, schema)
+				return
+			}
+			fp, fpErr := fingerprint.ComputeFingerprint(schemaIR, schema)
+			if fpErr != nil {
+				currentStates[i] = currentStateResult{err: fmt.Errorf("failed to compute source fingerprint: %w", fpErr)}
+				n := completed.Add(1)
+				fmt.Fprintf(os.Stderr, "  [%d/%d] %s (error)\n", n, totalSchemas, schema)
+				return
+			}
+			currentStates[i] = currentStateResult{schemaIR: schemaIR, fingerprint: fp}
+			n := completed.Add(1)
+			fmt.Fprintf(os.Stderr, "  [%d/%d] %s\n", n, totalSchemas, schema)
+		}(idx, schemaName)
+	}
+	wg.Wait()
+
+	// Phase 2: For each schema, apply desired state (sequential — provider is stateful),
+	// inspect desired state, generate diff using pre-fetched current state.
+	fmt.Fprintf(os.Stderr, "\nGenerating migration plans...\n")
+	for idx, schemaName := range schemas {
+		fmt.Fprintf(os.Stderr, "\n── Schema: %s [%d/%d] ──────────────────────\n", schemaName, idx+1, totalSchemas)
+
+		// Check if current state fetch failed.
+		cs := currentStates[idx]
+		if cs.err != nil {
+			fmt.Fprintf(os.Stderr, "Error for schema %s: %v\n", schemaName, cs.err)
+			hasErrors = true
+			continue
+		}
+
+		perSchemaConfig := &PlanConfig{
+			Host:            planHost,
+			Port:            planPort,
+			DB:              planDB,
+			User:            planUser,
+			Password:        finalPassword,
+			Schema:          schemaName,
+			File:            planFile,
+			ApplicationName: "pgschema",
+			SSLMode:         finalSSLMode,
+			PlanDBHost:      planDBHost,
+			PlanDBPort:      planDBPort,
+			PlanDBDatabase:  planDBDatabase,
+			PlanDBUser:      planDBUser,
+			PlanDBPassword:  finalPlanPassword,
+			PlanDBSSLMode:   planDBSSLMode,
+		}
+
+		migrationPlan, err := generateSchemaPlanWithCurrentState(perSchemaConfig, provider, desiredState, ignoreConfig, cs.schemaIR, cs.fingerprint)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error for schema %s: %v\n", schemaName, err)
+			hasErrors = true
+			continue
+		}
+
+		// Print per-schema human-readable preview to stderr so users get
+		// visibility even when only file outputs are configured.
+		fmt.Fprintln(os.Stderr, migrationPlan.HumanColored(!planNoColor))
+
+		plan.AddSchema(schemaName, migrationPlan)
+	}
+
+	// Check if debug flag is set
+	debug, _ := cmd.Root().PersistentFlags().GetBool("debug")
+
+	// Write combined output for all schemas
+	for _, output := range outputs {
+		if err := processOutput(plan, output, debug); err != nil {
+			return err
+		}
+	}
+
+	fmt.Fprintln(os.Stderr, "\n"+plan.SummaryString())
+
+	if hasErrors {
+		return fmt.Errorf("one or more schemas had errors")
+	}
+	return nil
+}
+
+func applyConfigToPlan(cmd *cobra.Command) {
+	cfg := config.Get()
+	if cfg == nil {
+		return
+	}
+
+	if !cmd.Flags().Changed("host") && cfg.Host != "" {
+		planHost = cfg.Host
+	}
+	if !cmd.Flags().Changed("port") && cfg.Port != 0 {
+		planPort = cfg.Port
+	}
+	if !cmd.Flags().Changed("db") && cfg.DB != "" {
+		planDB = cfg.DB
+	}
+	if !cmd.Flags().Changed("user") && cfg.User != "" {
+		planUser = cfg.User
+	}
+	if !cmd.Flags().Changed("password") && cfg.Password != "" {
+		planPassword = cfg.Password
+	}
+	if !cmd.Flags().Changed("schema") && cfg.Schema != "" {
+		planSchema = cfg.Schema
+	}
+	if !cmd.Flags().Changed("file") && cfg.File != "" {
+		planFile = cfg.File
+	}
+	if !cmd.Flags().Changed("sslmode") && cfg.SSLMode != "" {
+		planSSLMode = cfg.SSLMode
+	}
+	if !cmd.Flags().Changed("plan-host") && cfg.PlanHost != "" {
+		planDBHost = cfg.PlanHost
+	}
+	if !cmd.Flags().Changed("plan-port") && cfg.PlanPort != 0 {
+		planDBPort = cfg.PlanPort
+	}
+	if !cmd.Flags().Changed("plan-db") && cfg.PlanDB != "" {
+		planDBDatabase = cfg.PlanDB
+	}
+	if !cmd.Flags().Changed("plan-user") && cfg.PlanUser != "" {
+		planDBUser = cfg.PlanUser
+	}
+	if !cmd.Flags().Changed("plan-password") && cfg.PlanPassword != "" {
+		planDBPassword = cfg.PlanPassword
+	}
+	if !cmd.Flags().Changed("plan-sslmode") && cfg.PlanSSLMode != "" {
+		planDBSSLMode = cfg.PlanSSLMode
+	}
+	if !cmd.Flags().Changed("no-color") && cfg.NoColor {
+		planNoColor = cfg.NoColor
+	}
+	if !cmd.Flags().Changed("output-human") && cfg.OutputHuman != "" {
+		outputHuman = cfg.OutputHuman
+	}
+	if !cmd.Flags().Changed("output-json") && cfg.OutputJSON != "" {
+		outputJSON = cfg.OutputJSON
+	}
+	if !cmd.Flags().Changed("output-sql") && cfg.OutputSQL != "" {
+		outputSQL = cfg.OutputSQL
 	}
 }
 

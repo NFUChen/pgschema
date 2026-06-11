@@ -1,0 +1,13 @@
+Plan: 1 to modify.
+
+Summary by type:
+  tables: 1 to modify
+
+Tables:
+  ~ users
+    ~ is_active (column_rename)
+
+DDL to be executed:
+--------------------------------------------------
+
+ALTER TABLE users RENAME COLUMN active TO is_active;

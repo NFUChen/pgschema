@@ -25,6 +25,7 @@ const (
 	DiffTypeTableColumnComment
 	DiffTypeTableIndexComment
 	DiffTypeTablePersistence
+	DiffTypeTableColumnRename
 	DiffTypeView
 	DiffTypeViewTrigger
 	DiffTypeViewComment
@@ -43,6 +44,7 @@ const (
 	DiffTypePrivilege
 	DiffTypeRevokedDefaultPrivilege
 	DiffTypeColumnPrivilege
+	DiffTypeExtension
 )
 
 // String returns the string representation of DiffType
@@ -70,6 +72,8 @@ func (d DiffType) String() string {
 		return "table.index.comment"
 	case DiffTypeTablePersistence:
 		return "table.persistence"
+	case DiffTypeTableColumnRename:
+		return "table.column_rename"
 	case DiffTypeView:
 		return "view"
 	case DiffTypeViewTrigger:
@@ -106,6 +110,8 @@ func (d DiffType) String() string {
 		return "revoked_default_privilege"
 	case DiffTypeColumnPrivilege:
 		return "column_privilege"
+	case DiffTypeExtension:
+		return "extension"
 	default:
 		return "unknown"
 	}
@@ -146,6 +152,8 @@ func (d *DiffType) UnmarshalJSON(data []byte) error {
 		*d = DiffTypeTableIndexComment
 	case "table.persistence":
 		*d = DiffTypeTablePersistence
+	case "table.column_rename":
+		*d = DiffTypeTableColumnRename
 	case "view":
 		*d = DiffTypeView
 	case "view.trigger":
@@ -182,6 +190,8 @@ func (d *DiffType) UnmarshalJSON(data []byte) error {
 		*d = DiffTypeRevokedDefaultPrivilege
 	case "column_privilege":
 		*d = DiffTypeColumnPrivilege
+	case "extension":
+		*d = DiffTypeExtension
 	default:
 		return fmt.Errorf("unknown diff type: %s", s)
 	}
@@ -265,6 +275,8 @@ type Diff struct {
 }
 
 type ddlDiff struct {
+	addedExtensions   []string
+	droppedExtensions []string
 	addedSchemas              []*ir.Schema
 	droppedSchemas            []*ir.Schema
 	modifiedSchemas           []*schemaDiff
@@ -403,6 +415,7 @@ type tableDiff struct {
 	AddedColumns        []*ir.Column
 	DroppedColumns      []*ir.Column
 	ModifiedColumns     []*ColumnDiff
+	RenamedColumns      []*ColumnRename
 	AddedConstraints    []*ir.Constraint
 	DroppedConstraints  []*ir.Constraint
 	ModifiedConstraints []*ConstraintDiff
@@ -424,6 +437,12 @@ type tableDiff struct {
 
 // ColumnDiff represents changes to a column
 type ColumnDiff struct {
+	Old *ir.Column
+	New *ir.Column
+}
+
+// ColumnRename represents a column that was renamed
+type ColumnRename struct {
 	Old *ir.Column
 	New *ir.Column
 }
@@ -491,6 +510,26 @@ func GenerateMigration(oldIR, newIR *ir.IR, targetSchema string) []Diff {
 		addedColumnPrivileges:      []*ir.ColumnPrivilege{},
 		droppedColumnPrivileges:    []*ir.ColumnPrivilege{},
 		modifiedColumnPrivileges:   []*columnPrivilegeDiff{},
+	}
+
+	// Compare extensions
+	oldExtSet := make(map[string]bool)
+	for _, ext := range oldIR.Extensions {
+		oldExtSet[ext] = true
+	}
+	for _, ext := range newIR.Extensions {
+		if !oldExtSet[ext] {
+			diff.addedExtensions = append(diff.addedExtensions, ext)
+		}
+	}
+	newExtSet := make(map[string]bool)
+	for _, ext := range newIR.Extensions {
+		newExtSet[ext] = true
+	}
+	for _, ext := range oldIR.Extensions {
+		if !newExtSet[ext] {
+			diff.droppedExtensions = append(diff.droppedExtensions, ext)
+		}
 	}
 
 	// Compare schemas first in deterministic order
@@ -1715,6 +1754,18 @@ func (d *ddlDiff) generatePreDropRecreatedRegularViewsSQL(targetSchema string, c
 
 // generateCreateSQL generates CREATE statements in dependency order
 func (d *ddlDiff) generateCreateSQL(targetSchema string, collector *diffCollector) {
+	// Create extensions first - must be installed before any schema objects that depend on them
+	for _, ext := range d.addedExtensions {
+		context := &diffContext{
+			Type:                DiffTypeExtension,
+			Operation:           DiffOperationCreate,
+			Path:                ext,
+			Source:              &ir.Extension{Name: ext},
+			CanRunInTransaction: true,
+		}
+		collector.collect(context, fmt.Sprintf("CREATE EXTENSION IF NOT EXISTS %s;", ir.QuoteIdentifier(ext)))
+	}
+
 	// Note: Schema creation is out of scope for schema-level comparisons
 
 	// Build function lookup early - needed for both domain and table dependency checks
@@ -2182,6 +2233,10 @@ func sortTableObjects(tables []*tableDiff) {
 		sort.Slice(tableDiff.ModifiedColumns, func(i, j int) bool {
 			return tableDiff.ModifiedColumns[i].New.Position < tableDiff.ModifiedColumns[j].New.Position
 		})
+
+		sort.Slice(tableDiff.RenamedColumns, func(i, j int) bool {
+			return tableDiff.RenamedColumns[i].Old.Position < tableDiff.RenamedColumns[j].Old.Position
+		})
 	}
 }
 
@@ -2492,6 +2547,7 @@ func (d *triggerDiff) GetObjectName() string    { return d.New.Name }
 func (d *viewDiff) GetObjectName() string       { return d.New.Name }
 func (d *tableDiff) GetObjectName() string      { return d.Table.Name }
 func (d *ColumnDiff) GetObjectName() string     { return d.New.Name }
+func (d *ColumnRename) GetObjectName() string   { return d.New.Name }
 func (d *ConstraintDiff) GetObjectName() string { return d.New.Name }
 func (d *IndexDiff) GetObjectName() string      { return d.New.Name }
 func (d *policyDiff) GetObjectName() string     { return d.New.Name }

@@ -8,9 +8,10 @@ import (
 
 // IR represents the complete database schema intermediate representation
 type IR struct {
-	Metadata Metadata           `json:"metadata"`
-	Schemas  map[string]*Schema `json:"schemas"` // schema_name -> Schema
-	mu       sync.RWMutex       // Protects concurrent access to Schemas
+	Metadata   Metadata           `json:"metadata"`
+	Schemas    map[string]*Schema `json:"schemas"`              // schema_name -> Schema
+	Extensions []string           `json:"extensions,omitempty"` // Required extensions
+	mu         sync.RWMutex       // Protects concurrent access to Schemas
 }
 
 // Metadata contains information about the schema dump
@@ -733,6 +734,11 @@ func (s *Schema) SetType(name string, typ *Type) {
 	s.Types[name] = typ
 }
 
+// Extension represents a required PostgreSQL extension
+type Extension struct {
+	Name string `json:"name"`
+}
+
 // GetObjectName implementations for DiffSource interface
 func (t *Table) GetObjectName() string      { return t.Name }
 func (c *Column) GetObjectName() string     { return c.Name }
@@ -746,3 +752,4 @@ func (v *View) GetObjectName() string       { return v.Name }
 func (s *Sequence) GetObjectName() string   { return s.Name }
 func (t *Type) GetObjectName() string       { return t.Name }
 func (a *Aggregate) GetObjectName() string  { return a.Name }
+func (e *Extension) GetObjectName() string  { return e.Name }
