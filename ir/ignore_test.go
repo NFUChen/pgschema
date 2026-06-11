@@ -101,13 +101,16 @@ func TestIgnoreConfig_ShouldIgnoreTable(t *testing.T) {
 
 func TestIgnoreConfig_AllObjectTypes(t *testing.T) {
 	config := &IgnoreConfig{
-		Tables:     []string{"table_*"},
-		Views:      []string{"view_*"},
-		Functions:  []string{"fn_*"},
-		Procedures: []string{"sp_*"},
-		Types:      []string{"type_*"},
-		Sequences:  []string{"seq_*"},
-		Indexes:    []string{"idx_*"},
+		Tables:      []string{"table_*"},
+		Views:       []string{"view_*"},
+		Functions:   []string{"fn_*"},
+		Procedures:  []string{"sp_*"},
+		Aggregates:  []string{"agg_*"},
+		Types:       []string{"type_*"},
+		Sequences:   []string{"seq_*"},
+		Indexes:     []string{"idx_*"},
+		Constraints: []string{"fk_*"},
+		Triggers:    []string{"trg_*"},
 	}
 
 	// Test each object type
@@ -124,12 +127,18 @@ func TestIgnoreConfig_AllObjectTypes(t *testing.T) {
 		{config.ShouldIgnoreFunction, "get_user", false},
 		{config.ShouldIgnoreProcedure, "sp_temp", true},
 		{config.ShouldIgnoreProcedure, "process_data", false},
+		{config.ShouldIgnoreAggregate, "agg_temp", true},
+		{config.ShouldIgnoreAggregate, "group_concat", false},
 		{config.ShouldIgnoreType, "type_temp", true},
 		{config.ShouldIgnoreType, "user_status", false},
 		{config.ShouldIgnoreSequence, "seq_temp", true},
 		{config.ShouldIgnoreSequence, "user_id_seq", false},
 		{config.ShouldIgnoreIndex, "idx_temp", true},
 		{config.ShouldIgnoreIndex, "users_pkey", false},
+		{config.ShouldIgnoreConstraint, "fk_orders_product", true},
+		{config.ShouldIgnoreConstraint, "users_pkey", false},
+		{config.ShouldIgnoreTrigger, "trg_audit", true},
+		{config.ShouldIgnoreTrigger, "set_updated_at", false},
 	}
 
 	for _, tt := range tests {
@@ -156,6 +165,9 @@ func TestIgnoreConfig_NilConfig(t *testing.T) {
 	if config.ShouldIgnoreProcedure("any_procedure") {
 		t.Error("nil config should not ignore any procedure")
 	}
+	if config.ShouldIgnoreAggregate("any_aggregate") {
+		t.Error("nil config should not ignore any aggregate")
+	}
 	if config.ShouldIgnoreType("any_type") {
 		t.Error("nil config should not ignore any type")
 	}
@@ -164,6 +176,12 @@ func TestIgnoreConfig_NilConfig(t *testing.T) {
 	}
 	if config.ShouldIgnoreIndex("any_index") {
 		t.Error("nil config should not ignore any index")
+	}
+	if config.ShouldIgnoreConstraint("any_constraint") {
+		t.Error("nil config should not ignore any constraint")
+	}
+	if config.ShouldIgnoreTrigger("any_trigger") {
+		t.Error("nil config should not ignore any trigger")
 	}
 }
 

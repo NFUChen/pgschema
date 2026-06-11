@@ -20,9 +20,12 @@ type IgnoreConfig struct {
 	Views             []string `toml:"views,omitempty"`
 	Functions         []string `toml:"functions,omitempty"`
 	Procedures        []string `toml:"procedures,omitempty"`
+	Aggregates        []string `toml:"aggregates,omitempty"`
 	Types             []string `toml:"types,omitempty"`
 	Sequences         []string `toml:"sequences,omitempty"`
 	Indexes           []string `toml:"indexes,omitempty"`
+	Constraints       []string `toml:"constraints,omitempty"`
+	Triggers          []string `toml:"triggers,omitempty"`
 	Privileges        []string `toml:"privileges,omitempty"`
 	DefaultPrivileges []string `toml:"default_privileges,omitempty"`
 }
@@ -59,6 +62,14 @@ func (c *IgnoreConfig) ShouldIgnoreProcedure(procedureName string) bool {
 	return c.shouldIgnore(procedureName, c.Procedures)
 }
 
+// ShouldIgnoreAggregate checks if an aggregate should be ignored based on the patterns
+func (c *IgnoreConfig) ShouldIgnoreAggregate(aggregateName string) bool {
+	if c == nil {
+		return false
+	}
+	return c.shouldIgnore(aggregateName, c.Aggregates)
+}
+
 // ShouldIgnoreType checks if a type should be ignored based on the patterns
 func (c *IgnoreConfig) ShouldIgnoreType(typeName string) bool {
 	if c == nil {
@@ -81,6 +92,26 @@ func (c *IgnoreConfig) ShouldIgnoreIndex(indexName string) bool {
 		return false
 	}
 	return c.shouldIgnore(indexName, c.Indexes)
+}
+
+// ShouldIgnoreConstraint checks if a constraint should be ignored based on the patterns.
+// Patterns match on the constraint name, letting users preserve constraints that exist
+// in the database but are managed out-of-band (e.g. manually re-added after a DMS migration).
+func (c *IgnoreConfig) ShouldIgnoreConstraint(constraintName string) bool {
+	if c == nil {
+		return false
+	}
+	return c.shouldIgnore(constraintName, c.Constraints)
+}
+
+// ShouldIgnoreTrigger checks if a trigger should be ignored based on the patterns.
+// Patterns match on the trigger name, letting users exclude triggers created
+// out-of-band (e.g. triggers that an extension automatically adds to tracked tables).
+func (c *IgnoreConfig) ShouldIgnoreTrigger(triggerName string) bool {
+	if c == nil {
+		return false
+	}
+	return c.shouldIgnore(triggerName, c.Triggers)
 }
 
 // ShouldIgnorePrivilegeByObjectType checks if a privilege should be ignored based on the object name

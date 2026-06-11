@@ -171,7 +171,7 @@ func generateDropTriggersFromModifiedTables(tables []*tableDiff, targetSchema st
 	// Generate DROP TRIGGER statements for all collected triggers
 	for _, trigger := range allTriggers {
 		tableName := getTableNameWithSchema(trigger.Schema, trigger.Table, targetSchema)
-		sql := fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s;", trigger.Name, tableName)
+		sql := fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s;", ir.QuoteIdentifier(trigger.Name), tableName)
 
 		context := &diffContext{
 			Type:                DiffTypeTableTrigger,
@@ -186,11 +186,18 @@ func generateDropTriggersFromModifiedTables(tables []*tableDiff, targetSchema st
 
 // generateDropTriggersFromModifiedViews collects and drops all triggers from modified views
 // This ensures view triggers are dropped before their associated functions
-func generateDropTriggersFromModifiedViews(views []*viewDiff, targetSchema string, collector *diffCollector) {
+// preDroppedViews contains views already dropped in the pre-drop phase: their
+// triggers are gone with the view, and DROP TRIGGER ... ON <view> would fail
+// because the relation no longer exists (IF EXISTS only covers the trigger name)
+func generateDropTriggersFromModifiedViews(views []*viewDiff, targetSchema string, collector *diffCollector, preDroppedViews map[string]bool) {
 	var allTriggers []*ir.Trigger
 
 	// Collect all dropped triggers from modified views
 	for _, viewDiff := range views {
+		viewKey := viewDiff.Old.Schema + "." + viewDiff.Old.Name
+		if preDroppedViews != nil && preDroppedViews[viewKey] {
+			continue
+		}
 		for _, trigger := range viewDiff.DroppedTriggers {
 			allTriggers = append(allTriggers, trigger)
 		}
@@ -204,7 +211,7 @@ func generateDropTriggersFromModifiedViews(views []*viewDiff, targetSchema strin
 	// Generate DROP TRIGGER statements for all collected triggers
 	for _, trigger := range allTriggers {
 		tableName := getTableNameWithSchema(trigger.Schema, trigger.Table, targetSchema)
-		sql := fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s;", trigger.Name, tableName)
+		sql := fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s;", ir.QuoteIdentifier(trigger.Name), tableName)
 
 		context := &diffContext{
 			Type:                DiffTypeViewTrigger,
@@ -226,6 +233,8 @@ func generateTriggerSQLWithMode(trigger *ir.Trigger, targetSchema string) string
 		for _, triggerEvent := range trigger.Events {
 			if triggerEvent == orderEvent {
 				if triggerEvent == ir.TriggerEventUpdate && len(trigger.UpdateColumns) > 0 {
+					// UpdateColumns are extracted verbatim from pg_get_triggerdef(),
+					// so mixed-case names already carry their double quotes — emit as-is.
 					events = append(events, "UPDATE OF "+strings.Join(trigger.UpdateColumns, ", "))
 				} else {
 					events = append(events, string(triggerEvent))
@@ -242,10 +251,10 @@ func generateTriggerSQLWithMode(trigger *ir.Trigger, targetSchema string) string
 	// Build REFERENCING clause if present (for transition tables)
 	var referencingParts []string
 	if trigger.OldTable != "" {
-		referencingParts = append(referencingParts, fmt.Sprintf("OLD TABLE AS %s", trigger.OldTable))
+		referencingParts = append(referencingParts, fmt.Sprintf("OLD TABLE AS %s", ir.QuoteIdentifier(trigger.OldTable)))
 	}
 	if trigger.NewTable != "" {
-		referencingParts = append(referencingParts, fmt.Sprintf("NEW TABLE AS %s", trigger.NewTable))
+		referencingParts = append(referencingParts, fmt.Sprintf("NEW TABLE AS %s", ir.QuoteIdentifier(trigger.NewTable)))
 	}
 	referencingClause := ""
 	if len(referencingParts) > 0 {
@@ -273,7 +282,7 @@ func generateTriggerSQLWithMode(trigger *ir.Trigger, targetSchema string) string
 		stmt += fmt.Sprintf("\n    FOR EACH %s", trigger.Level)
 	} else {
 		stmt = fmt.Sprintf("CREATE OR REPLACE TRIGGER %s\n    %s %s ON %s",
-			trigger.Name, trigger.Timing, eventList, tableName)
+			ir.QuoteIdentifier(trigger.Name), trigger.Timing, eventList, tableName)
 		// Add REFERENCING clause before FOR EACH
 		stmt += referencingClause
 		stmt += fmt.Sprintf("\n    FOR EACH %s", trigger.Level)

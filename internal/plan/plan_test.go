@@ -8,6 +8,7 @@ import (
 
 	"github.com/pgplex/pgschema/internal/diff"
 	"github.com/pgplex/pgschema/internal/fingerprint"
+	"github.com/pgplex/pgschema/ir"
 )
 
 func TestPlan_AddSchemaAndHasAnyChanges(t *testing.T) {
@@ -305,5 +306,43 @@ func TestPlan_CreatedAt_UsesTestTime(t *testing.T) {
 	expected, _ := time.Parse(time.RFC3339, "2024-06-15T12:00:00Z")
 	if !p.CreatedAt.Equal(expected) {
 		t.Errorf("created_at = %v, want %v", p.CreatedAt, expected)
+	}
+}
+
+// TestPartitionedParentIndexRewrite verifies that index rewrites on partitioned
+// parents fall back to the canonical synchronous DDL instead of emitting
+// CREATE INDEX CONCURRENTLY, which PostgreSQL rejects with SQLSTATE 0A000 (#418).
+func TestPartitionedParentIndexRewrite(t *testing.T) {
+	regular := &ir.Index{Schema: "public", Table: "events", Name: "events_idx",
+		Type: ir.IndexTypeRegular, Columns: []*ir.IndexColumn{{Name: "occurred"}}}
+	partitioned := *regular
+	partitioned.IsPartitioned = true
+
+	// CREATE path
+	if steps := generateIndexRewrite(&partitioned); steps != nil {
+		t.Errorf("generateIndexRewrite on partitioned parent: got %d steps, want nil (synchronous fallback)", len(steps))
+	}
+	if steps := generateIndexRewrite(regular); len(steps) == 0 {
+		t.Error("generateIndexRewrite on regular table: want concurrent rewrite steps, got nil")
+	} else if !strings.Contains(steps[0].SQL, "CONCURRENTLY") {
+		t.Errorf("generateIndexRewrite on regular table: expected CONCURRENTLY, got %q", steps[0].SQL)
+	}
+
+	// ALTER/replacement path (source is new index)
+	if steps := generateIndexChangeRewriteFromIndex(&partitioned); steps != nil {
+		t.Errorf("generateIndexChangeRewriteFromIndex on partitioned parent: got %d steps, want nil", len(steps))
+	}
+	if steps := generateIndexChangeRewriteFromIndex(regular); len(steps) == 0 {
+		t.Error("generateIndexChangeRewriteFromIndex on regular table: want rewrite steps, got nil")
+	}
+
+	// ALTER/replacement path (source is IndexDiff)
+	partDiff := &diff.IndexDiff{Old: &partitioned, New: &partitioned}
+	if steps := generateIndexChangeRewrite(partDiff); steps != nil {
+		t.Errorf("generateIndexChangeRewrite on partitioned parent: got %d steps, want nil", len(steps))
+	}
+	regDiff := &diff.IndexDiff{Old: regular, New: regular}
+	if steps := generateIndexChangeRewrite(regDiff); len(steps) == 0 {
+		t.Error("generateIndexChangeRewrite on regular table: want rewrite steps, got nil")
 	}
 }

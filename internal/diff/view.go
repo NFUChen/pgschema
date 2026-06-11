@@ -136,17 +136,27 @@ func generateModifyViewsSQL(diffs []*viewDiff, targetSchema string, collector *d
 				depView := dependentViews[i]
 				depViewKey := depView.Schema + "." + depView.Name
 
-				// Skip if already dropped (view depends on multiple views being recreated)
-				if droppedDependentViews[depViewKey] {
+				// Skip if already dropped (view depends on multiple views being
+				// recreated, or was dropped in the pre-drop phase)
+				if droppedDependentViews[depViewKey] || (preDroppedViews != nil && preDroppedViews[depViewKey]) {
 					continue
 				}
 				droppedDependentViews[depViewKey] = true
 
 				depViewName := qualifyEntityName(depView.Schema, depView.Name, targetSchema)
+
+				// Use the correct DROP variant based on relkind. IF EXISTS does NOT
+				// suppress the error when the object exists with a different relkind,
+				// so dropping a materialized view with DROP VIEW fails (issue #415).
+				depDiffType := DiffTypeView
 				dropDepSQL := fmt.Sprintf("DROP VIEW IF EXISTS %s RESTRICT;", depViewName)
+				if depView.Materialized {
+					depDiffType = DiffTypeMaterializedView
+					dropDepSQL = fmt.Sprintf("DROP MATERIALIZED VIEW IF EXISTS %s RESTRICT;", depViewName)
+				}
 
 				depContext := &diffContext{
-					Type:                DiffTypeView,
+					Type:                depDiffType,
 					Operation:           DiffOperationRecreate,
 					Path:                fmt.Sprintf("%s.%s", depView.Schema, depView.Name),
 					Source:              depView,
@@ -239,12 +249,33 @@ func generateModifyViewsSQL(diffs []*viewDiff, targetSchema string, collector *d
 				generateCreateIndexesSQLWithType(indexList, targetSchema, collector, DiffTypeMaterializedViewIndex, DiffTypeMaterializedViewIndexComment)
 			}
 
+			// Dropping the view also dropped its triggers (e.g., INSTEAD OF
+			// triggers), so recreate the desired-state triggers
+			if len(diff.New.Triggers) > 0 {
+				triggerList := make([]*ir.Trigger, 0, len(diff.New.Triggers))
+				for _, trigger := range diff.New.Triggers {
+					triggerList = append(triggerList, trigger)
+				}
+				generateCreateViewTriggersSQL(triggerList, targetSchema, collector)
+			}
+
 			continue // Skip the normal processing for this view
 		}
 
 		// Skip views that were already recreated as dependencies of a materialized view
 		viewKey := diff.New.Schema + "." + diff.New.Name
 		if recreatedViews != nil && recreatedViews[viewKey] {
+			continue
+		}
+
+		// Skip views that were (or will be) dropped as part of a recreation
+		// chain: the dependent recreation phase below rebuilds them entirely
+		// from the desired-state IR (definition, options, comment, indexes,
+		// triggers). Emitting metadata statements here (e.g., COMMENT ON VIEW)
+		// would target a relation that does not exist at this point in the
+		// plan. Recreate diffs are sorted first, so droppedDependentViews is
+		// fully populated before any non-recreate diff is processed.
+		if droppedDependentViews[viewKey] || (preDroppedViews != nil && preDroppedViews[viewKey]) {
 			continue
 		}
 
@@ -385,7 +416,7 @@ func generateModifyViewsSQL(diffs []*viewDiff, targetSchema string, collector *d
 		for _, triggerDiff := range diff.ModifiedTriggers {
 			if triggerDiff.New.IsConstraint {
 				viewName := getTableNameWithSchema(diff.New.Schema, diff.New.Name, targetSchema)
-				dropSQL := fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s;", triggerDiff.Old.Name, viewName)
+				dropSQL := fmt.Sprintf("DROP TRIGGER IF EXISTS %s ON %s;", ir.QuoteIdentifier(triggerDiff.Old.Name), viewName)
 				dropContext := &diffContext{
 					Type:                DiffTypeViewTrigger,
 					Operation:           DiffOperationDrop,
@@ -433,8 +464,19 @@ func generateModifyViewsSQL(diffs []*viewDiff, targetSchema string, collector *d
 
 		createDepSQL := generateViewSQL(depView, targetSchema)
 
+		// Categorize using the correct relkind so materialized dependents are
+		// reported (and commented) as materialized views (issue #415).
+		depDiffType := DiffTypeView
+		depCommentType := DiffTypeViewComment
+		commentKeyword := "VIEW"
+		if depView.Materialized {
+			depDiffType = DiffTypeMaterializedView
+			depCommentType = DiffTypeMaterializedViewComment
+			commentKeyword = "MATERIALIZED VIEW"
+		}
+
 		depContext := &diffContext{
-			Type:                DiffTypeView,
+			Type:                depDiffType,
 			Operation:           DiffOperationRecreate,
 			Path:                fmt.Sprintf("%s.%s", depView.Schema, depView.Name),
 			Source:              depView,
@@ -450,15 +492,35 @@ func generateModifyViewsSQL(diffs []*viewDiff, targetSchema string, collector *d
 		// Recreate view comment if present
 		if depView.Comment != "" {
 			depViewName := qualifyEntityName(depView.Schema, depView.Name, targetSchema)
-			commentSQL := fmt.Sprintf("COMMENT ON VIEW %s IS %s;", depViewName, quoteString(depView.Comment))
+			commentSQL := fmt.Sprintf("COMMENT ON %s %s IS %s;", commentKeyword, depViewName, quoteString(depView.Comment))
 			commentContext := &diffContext{
-				Type:                DiffTypeViewComment,
+				Type:                depCommentType,
 				Operation:           DiffOperationCreate,
 				Path:                fmt.Sprintf("%s.%s", depView.Schema, depView.Name),
 				Source:              depView,
 				CanRunInTransaction: true,
 			}
 			collector.collect(commentContext, commentSQL)
+		}
+
+		// Dropping a materialized view also drops its indexes, so recreate them
+		// for materialized dependents (issue #415).
+		if depView.Materialized && depView.Indexes != nil {
+			indexList := make([]*ir.Index, 0, len(depView.Indexes))
+			for _, index := range depView.Indexes {
+				indexList = append(indexList, index)
+			}
+			generateCreateIndexesSQLWithType(indexList, targetSchema, collector, DiffTypeMaterializedViewIndex, DiffTypeMaterializedViewIndexComment)
+		}
+
+		// Dropping the view also dropped its triggers (e.g., INSTEAD OF
+		// triggers), so recreate the desired-state triggers
+		if len(depView.Triggers) > 0 {
+			triggerList := make([]*ir.Trigger, 0, len(depView.Triggers))
+			for _, trigger := range depView.Triggers {
+				triggerList = append(triggerList, trigger)
+			}
+			generateCreateViewTriggersSQL(triggerList, targetSchema, collector)
 		}
 	}
 }
@@ -746,26 +808,85 @@ func containsIdentifier(sqlText, identifier string) bool {
 }
 
 // viewDependsOnTable checks if a view depends on a specific table
-// by checking if the table name appears in the view definition
+// by checking if the table name appears in the view definition.
+// Uses whole-word identifier matching (not plain substring) so that a table
+// named "foo" does not falsely match "foobar" or an unrelated alias/CTE.
 func viewDependsOnTable(view *ir.View, tableSchema, tableName string) bool {
 	if view == nil || view.Definition == "" {
 		return false
 	}
 
-	def := strings.ToLower(view.Definition)
-	tableNameLower := strings.ToLower(tableName)
-
 	// Check for unqualified table name
-	if strings.Contains(def, tableNameLower) {
+	if containsIdentifier(view.Definition, tableName) {
 		return true
 	}
 
 	// Check for qualified table name (schema.table)
-	qualifiedName := strings.ToLower(tableSchema + "." + tableName)
-	if strings.Contains(def, qualifiedName) {
+	if containsIdentifier(view.Definition, tableSchema+"."+tableName) {
 		return true
 	}
 
+	return false
+}
+
+// buildModifiedTableAddedColumnLookup returns a map of lowercased schema.tableName
+// to a set of lowercased column names being added by ALTER TABLE on that table.
+func buildModifiedTableAddedColumnLookup(modifiedTables []*tableDiff) map[string]map[string]struct{} {
+	lookup := make(map[string]map[string]struct{})
+	for _, td := range modifiedTables {
+		if len(td.AddedColumns) == 0 {
+			continue
+		}
+		key := strings.ToLower(td.Table.Schema + "." + td.Table.Name)
+		cols := make(map[string]struct{}, len(td.AddedColumns))
+		for _, c := range td.AddedColumns {
+			cols[strings.ToLower(c.Name)] = struct{}{}
+		}
+		lookup[key] = cols
+	}
+	return lookup
+}
+
+// viewReferencesAnyDeferredView reports whether the view's body references any
+// of the provided deferred views by name. Used for transitive deferral so that
+// view chains (V2 -> V1 -> added column) move together to the modify phase.
+func viewReferencesAnyDeferredView(view *ir.View, deferred []*ir.View) bool {
+	if view == nil || view.Definition == "" || len(deferred) == 0 {
+		return false
+	}
+	for _, dv := range deferred {
+		if viewDependsOnView(view, dv.Name) {
+			return true
+		}
+		if dv.Schema != "" && viewDependsOnView(view, dv.Schema+"."+dv.Name) {
+			return true
+		}
+	}
+	return false
+}
+
+// viewReferencesAddedColumn reports whether the view's definition references
+// any modified table AND at least one of the columns being added to that table.
+// Both checks are required to avoid deferring views that simply happen to
+// mention a column name being added to an unrelated table.
+func viewReferencesAddedColumn(view *ir.View, addedCols map[string]map[string]struct{}) bool {
+	if view == nil || view.Definition == "" || len(addedCols) == 0 {
+		return false
+	}
+	for tableKey, cols := range addedCols {
+		parts := strings.SplitN(tableKey, ".", 2)
+		if len(parts) != 2 {
+			continue
+		}
+		if !viewDependsOnTable(view, parts[0], parts[1]) {
+			continue
+		}
+		for col := range cols {
+			if containsIdentifier(view.Definition, col) {
+				return true
+			}
+		}
+	}
 	return false
 }
 
@@ -872,11 +993,11 @@ func findTransitiveDependents(initialViews []*ir.View, allViews map[string]*ir.V
 		current := queue[0]
 		queue = queue[1:]
 
-		// Find views that depend on the current view
+		// Find views that depend on the current view. Materialized views are
+		// included: a matview stacked on a dependent regular view blocks that
+		// view's RESTRICT drop just like a regular view would, and the
+		// recreation path already handles materialized dependents (issue #415).
 		for _, view := range allViews {
-			if view.Materialized {
-				continue // Skip materialized views
-			}
 			viewKey := view.Schema + "." + view.Name
 			if visited[viewKey] {
 				continue

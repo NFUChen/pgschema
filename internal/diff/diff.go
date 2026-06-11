@@ -35,6 +35,7 @@ const (
 	DiffTypeMaterializedViewIndexComment
 	DiffTypeFunction
 	DiffTypeProcedure
+	DiffTypeAggregate
 	DiffTypeSequence
 	DiffTypeType
 	DiffTypeDomain
@@ -91,6 +92,8 @@ func (d DiffType) String() string {
 		return "function"
 	case DiffTypeProcedure:
 		return "procedure"
+	case DiffTypeAggregate:
+		return "aggregate"
 	case DiffTypeSequence:
 		return "sequence"
 	case DiffTypeType:
@@ -169,6 +172,8 @@ func (d *DiffType) UnmarshalJSON(data []byte) error {
 		*d = DiffTypeFunction
 	case "procedure":
 		*d = DiffTypeProcedure
+	case "aggregate":
+		*d = DiffTypeAggregate
 	case "sequence":
 		*d = DiffTypeSequence
 	case "type":
@@ -288,6 +293,9 @@ type ddlDiff struct {
 	addedProcedures           []*ir.Procedure
 	droppedProcedures         []*ir.Procedure
 	modifiedProcedures        []*procedureDiff
+	addedAggregates           []*ir.Aggregate
+	droppedAggregates         []*ir.Aggregate
+	modifiedAggregates        []*aggregateDiff
 	addedTypes                []*ir.Type
 	droppedTypes              []*ir.Type
 	modifiedTypes             []*typeDiff
@@ -308,6 +316,20 @@ type ddlDiff struct {
 	addedColumnPrivileges    []*ir.ColumnPrivilege
 	droppedColumnPrivileges  []*ir.ColumnPrivilege
 	modifiedColumnPrivileges []*columnPrivilegeDiff
+	// Newly-added views that reference newly-added columns on modified tables.
+	// Created in the modify phase, AFTER generateModifyTablesSQL, so the columns
+	// exist when the view body is parsed (issue #414).
+	deferredAddedViews             []*ir.View
+	functionsAwaitingDeferredViews []*ir.Function
+	// Foreign keys that depend on a unique/PK constraint being dropped or
+	// recreated by this migration: existing ones are dropped before the table
+	// modifications (fkPreDrops) and desired-state ones are (re)created
+	// afterwards (fkPostAdds). FKs on newly added tables that would bind to the
+	// old constraint are kept out of CREATE TABLE (suppressedInlineFKs) and
+	// created via fkPostAdds instead (issue #439).
+	fkPreDrops          []*ir.Constraint
+	fkPostAdds          []*deferredConstraint
+	suppressedInlineFKs map[string]bool
 }
 
 // schemaDiff represents changes to a schema
@@ -326,6 +348,12 @@ type functionDiff struct {
 type procedureDiff struct {
 	Old *ir.Procedure
 	New *ir.Procedure
+}
+
+// aggregateDiff represents changes to an aggregate
+type aggregateDiff struct {
+	Old *ir.Aggregate
+	New *ir.Aggregate
 }
 
 // typeDiff represents changes to a type
@@ -371,7 +399,7 @@ type viewDiff struct {
 	CommentChanged   bool
 	OldComment       string
 	NewComment       string
-	OptionsChanged   bool // View options (reloptions) changed
+	OptionsChanged   bool           // View options (reloptions) changed
 	AddedIndexes     []*ir.Index    // For materialized views
 	DroppedIndexes   []*ir.Index    // For materialized views
 	ModifiedIndexes  []*IndexDiff   // For materialized views
@@ -462,6 +490,9 @@ func GenerateMigration(oldIR, newIR *ir.IR, targetSchema string) []Diff {
 		addedProcedures:            []*ir.Procedure{},
 		droppedProcedures:          []*ir.Procedure{},
 		modifiedProcedures:         []*procedureDiff{},
+		addedAggregates:            []*ir.Aggregate{},
+		droppedAggregates:          []*ir.Aggregate{},
+		modifiedAggregates:         []*aggregateDiff{},
 		addedTypes:                 []*ir.Type{},
 		droppedTypes:               []*ir.Type{},
 		modifiedTypes:              []*typeDiff{},
@@ -719,6 +750,63 @@ func GenerateMigration(oldIR, newIR *ir.IR, targetSchema string) []Diff {
 				diff.modifiedProcedures = append(diff.modifiedProcedures, &procedureDiff{
 					Old: oldProcedure,
 					New: newProcedure,
+				})
+			}
+		}
+	}
+
+	// Compare aggregates across all schemas
+	oldAggregates := make(map[string]*ir.Aggregate)
+	newAggregates := make(map[string]*ir.Aggregate)
+
+	// Extract aggregates from all schemas in oldIR in deterministic order
+	for _, dbSchema := range oldIR.Schemas {
+		aggNames := sortedKeys(dbSchema.Aggregates)
+		for _, aggName := range aggNames {
+			aggregate := dbSchema.Aggregates[aggName]
+			// aggName already contains signature as name(arguments) from inspector
+			key := aggregate.Schema + "." + aggName
+			oldAggregates[key] = aggregate
+		}
+	}
+
+	// Extract aggregates from all schemas in newIR in deterministic order
+	for _, dbSchema := range newIR.Schemas {
+		aggNames := sortedKeys(dbSchema.Aggregates)
+		for _, aggName := range aggNames {
+			aggregate := dbSchema.Aggregates[aggName]
+			// aggName already contains signature as name(arguments) from inspector
+			key := aggregate.Schema + "." + aggName
+			newAggregates[key] = aggregate
+		}
+	}
+
+	// Find added aggregates in deterministic order
+	aggregateKeys := sortedKeys(newAggregates)
+	for _, key := range aggregateKeys {
+		aggregate := newAggregates[key]
+		if _, exists := oldAggregates[key]; !exists {
+			diff.addedAggregates = append(diff.addedAggregates, aggregate)
+		}
+	}
+
+	// Find dropped aggregates in deterministic order
+	oldAggregateKeys := sortedKeys(oldAggregates)
+	for _, key := range oldAggregateKeys {
+		aggregate := oldAggregates[key]
+		if _, exists := newAggregates[key]; !exists {
+			diff.droppedAggregates = append(diff.droppedAggregates, aggregate)
+		}
+	}
+
+	// Find modified aggregates in deterministic order
+	for _, key := range aggregateKeys {
+		newAggregate := newAggregates[key]
+		if oldAggregate, exists := oldAggregates[key]; exists {
+			if !aggregatesEqual(oldAggregate, newAggregate) {
+				diff.modifiedAggregates = append(diff.modifiedAggregates, &aggregateDiff{
+					Old: oldAggregate,
+					New: newAggregate,
 				})
 			}
 		}
@@ -1419,6 +1507,10 @@ func GenerateMigration(oldIR, newIR *ir.IR, targetSchema string) []Diff {
 	// Sort individual table objects (indexes, triggers, policies, constraints) within each table
 	sortTableObjects(diff.modifiedTables)
 
+	// Detect foreign keys bound to unique/PK constraints being replaced; they
+	// must be dropped before and recreated after the replacement (issue #439)
+	diff.fkPreDrops, diff.fkPostAdds, diff.suppressedInlineFKs = planFKRecreationForReplacedConstraints(diff.modifiedTables, diff.addedTables, oldTables, newTables)
+
 	// Create a diffCollector and generate SQL
 	collector := newDiffCollector()
 	diff.collectMigrationSQL(targetSchema, collector)
@@ -1462,6 +1554,12 @@ func (d *ddlDiff) generatePreDropMaterializedViewsSQL(targetSchema string, colle
 	if len(affectedTables) == 0 {
 		return preDropped
 	}
+
+	// Pre-drop regular views that require recreation and depend on tables with
+	// destructive changes (dropped tables or dropped columns). The ALTER TABLE
+	// DROP COLUMN / DROP TABLE runs before the modify-views phase, so the live
+	// view would block it with SQLSTATE 2BP01 (issue #444).
+	d.generatePreDropRecreatedRegularViewsSQL(targetSchema, collector, preDropped)
 
 	// Check modifiedViews with RequiresRecreate for dependencies on affected tables
 	for _, viewDiff := range d.modifiedViews {
@@ -1532,6 +1630,126 @@ func (d *ddlDiff) generatePreDropMaterializedViewsSQL(targetSchema string, colle
 	}
 
 	return preDropped
+}
+
+// generatePreDropRecreatedRegularViewsSQL pre-drops regular (non-materialized)
+// views that require recreation and whose old definition depends on a table
+// being dropped or losing columns. Without this, the ALTER TABLE DROP COLUMN /
+// DROP TABLE emitted earlier in the plan fails because the live view still
+// depends on the column or table (issue #444). Transitive dependent views are
+// dropped first so the RESTRICT drops succeed; they are recreated later by the
+// modify-views phase. Pre-dropped views are recorded in preDropped so the
+// modify-views phase skips their DROP and only emits the CREATE.
+func (d *ddlDiff) generatePreDropRecreatedRegularViewsSQL(targetSchema string, collector *diffCollector, preDropped map[string]bool) {
+	// Build the set of tables with destructive changes
+	destructiveTables := []*ir.Table{}
+	destructiveTables = append(destructiveTables, d.droppedTables...)
+	for _, tableDiff := range d.modifiedTables {
+		if len(tableDiff.DroppedColumns) > 0 {
+			destructiveTables = append(destructiveTables, tableDiff.Table)
+		}
+	}
+	if len(destructiveTables) == 0 {
+		return
+	}
+
+	// Collect old views to pre-drop
+	var viewsToPreDrop []*ir.View
+	for _, viewDiff := range d.modifiedViews {
+		if !viewDiff.RequiresRecreate || viewDiff.New.Materialized {
+			continue
+		}
+		for _, table := range destructiveTables {
+			if viewDependsOnTable(viewDiff.Old, table.Schema, table.Name) {
+				viewsToPreDrop = append(viewsToPreDrop, viewDiff.Old)
+				break
+			}
+		}
+	}
+	if len(viewsToPreDrop) == 0 {
+		return
+	}
+
+	// Dependent views must be dropped before the views they reference. They
+	// are recreated later by the modify-views phase.
+	dependentViewsCtx := findDependentViewsForRecreatedViews(d.allNewViews, d.modifiedViews, d.addedViews)
+
+	toDrop := make(map[string]*ir.View)
+	var insertionOrder []string
+	addView := func(view *ir.View) {
+		key := view.Schema + "." + view.Name
+		if _, exists := toDrop[key]; !exists {
+			toDrop[key] = view
+			insertionOrder = append(insertionOrder, key)
+		}
+	}
+	for _, view := range viewsToPreDrop {
+		addView(view)
+		for _, depView := range dependentViewsCtx.GetDependents(view.Schema + "." + view.Name) {
+			addView(depView)
+		}
+	}
+
+	// Views dropped by this migration are not in allNewViews, so the dependent
+	// context above cannot see them. If such a view depends on a view being
+	// pre-dropped, hoist its DROP here too — otherwise the RESTRICT pre-drop
+	// fails because the normal drop phase runs only after pre-drop. The drop
+	// phase skips them via filterPreDroppedViews.
+	hoistedDroppedViews := make(map[string]bool)
+	for changed := true; changed; {
+		changed = false
+		for _, droppedView := range d.droppedViews {
+			key := droppedView.Schema + "." + droppedView.Name
+			if _, exists := toDrop[key]; exists {
+				continue
+			}
+			for _, target := range toDrop {
+				if viewDependsOnView(droppedView, target.Name) ||
+					viewDependsOnView(droppedView, target.Schema+"."+target.Name) {
+					addView(droppedView)
+					hoistedDroppedViews[key] = true
+					changed = true
+					break
+				}
+			}
+		}
+	}
+
+	// Drop dependents before the views they reference
+	views := make([]*ir.View, 0, len(toDrop))
+	for _, key := range insertionOrder {
+		views = append(views, toDrop[key])
+	}
+	views = reverseSlice(topologicallySortViews(views))
+
+	for _, view := range views {
+		viewKey := view.Schema + "." + view.Name
+		if preDropped[viewKey] {
+			continue
+		}
+
+		viewName := qualifyEntityName(view.Schema, view.Name, targetSchema)
+		diffType := DiffTypeView
+		sql := fmt.Sprintf("DROP VIEW IF EXISTS %s RESTRICT;", viewName)
+		if view.Materialized {
+			diffType = DiffTypeMaterializedView
+			sql = fmt.Sprintf("DROP MATERIALIZED VIEW IF EXISTS %s RESTRICT;", viewName)
+		}
+		operation := DiffOperationRecreate
+		if hoistedDroppedViews[viewKey] {
+			operation = DiffOperationDrop
+		}
+
+		context := &diffContext{
+			Type:                diffType,
+			Operation:           operation,
+			Path:                fmt.Sprintf("%s.%s", view.Schema, view.Name),
+			Source:              view,
+			CanRunInTransaction: true,
+		}
+		collector.collect(context, sql)
+		preDropped[viewKey] = true
+	}
 }
 
 // generateCreateSQL generates CREATE statements in dependency order
@@ -1618,7 +1836,7 @@ func (d *ddlDiff) generateCreateSQL(targetSchema string, collector *diffCollecto
 	}
 
 	// Create tables WITHOUT function/domain dependencies first (functions may reference these)
-	deferredPolicies1, deferredConstraints1 := generateCreateTablesSQL(tablesWithoutDeps, targetSchema, collector, existingTables, shouldDeferPolicy)
+	deferredPolicies1, deferredConstraints1 := generateCreateTablesSQL(tablesWithoutDeps, targetSchema, collector, existingTables, shouldDeferPolicy, d.suppressedInlineFKs)
 
 	// Build view lookup - needed for detecting functions that depend on views
 	newViewLookup := buildViewLookup(d.addedViews)
@@ -1649,12 +1867,17 @@ func (d *ddlDiff) generateCreateSQL(targetSchema string, collector *diffCollecto
 	generateCreateProceduresSQL(d.addedProcedures, targetSchema, collector)
 
 	// Create tables WITH function/domain dependencies (now that functions and deferred domains exist)
-	deferredPolicies2, deferredConstraints2 := generateCreateTablesSQL(tablesWithDeps, targetSchema, collector, existingTables, shouldDeferPolicy)
+	deferredPolicies2, deferredConstraints2 := generateCreateTablesSQL(tablesWithDeps, targetSchema, collector, existingTables, shouldDeferPolicy, d.suppressedInlineFKs)
 
 	// Add deferred foreign key constraints from BOTH batches AFTER all tables are created
 	// This ensures FK references to tables in the second batch (function-dependent tables) work correctly
 	allDeferredConstraints := append(deferredConstraints1, deferredConstraints2...)
 	generateDeferredConstraintsSQL(allDeferredConstraints, targetSchema, collector)
+
+	// Create aggregates after their transition/final functions AND all tables exist
+	// (an aggregate may use a new table's row type as an argument or state type), and
+	// before views, which may reference the aggregates in their definitions.
+	generateCreateAggregatesSQL(d.addedAggregates, targetSchema, collector)
 
 	// Merge deferred policies from both batches
 	allDeferredPolicies := append(deferredPolicies1, deferredPolicies2...)
@@ -1666,8 +1889,61 @@ func (d *ddlDiff) generateCreateSQL(targetSchema string, collector *diffCollecto
 	// Note: We need to create triggers for ALL tables, not just the original d.addedTables
 	generateCreateTriggersFromTables(d.addedTables, targetSchema, collector)
 
-	// Create views
-	generateCreateViewsSQL(d.addedViews, targetSchema, collector)
+	// Create views, deferring any whose body references a newly-added column on a
+	// modified table. Those columns are emitted by generateModifyTablesSQL during
+	// the modify phase, so deferred views are created there (issue #414)
+	addedColLookup := buildModifiedTableAddedColumnLookup(d.modifiedTables)
+	viewsToCreateNow := d.addedViews
+	if len(addedColLookup) > 0 {
+		viewsToCreateNow = nil
+		for _, v := range d.addedViews {
+			if viewReferencesAddedColumn(v, addedColLookup) {
+				d.deferredAddedViews = append(d.deferredAddedViews, v)
+			} else {
+				viewsToCreateNow = append(viewsToCreateNow, v)
+			}
+		}
+
+		// Transitive closure: also defer any view whose body references a view
+		// already in deferredAddedViews. Iterate to fixpoint so chains of any
+		// length (V3 -> V2 -> V1 -> added column) move together. Walking
+		// viewsToCreateNow in order preserves topological ordering on each pass.
+		// Each iteration reads d.deferredAddedViews fresh, so a view appended
+		// during this pass is visible to the very next sibling examined — that
+		// is what lets a topo-sorted chain drain in a single pass.
+		for {
+			var stillNow []*ir.View
+			added := false
+			for _, v := range viewsToCreateNow {
+				if viewReferencesAnyDeferredView(v, d.deferredAddedViews) {
+					d.deferredAddedViews = append(d.deferredAddedViews, v)
+					added = true
+				} else {
+					stillNow = append(stillNow, v)
+				}
+			}
+			viewsToCreateNow = stillNow
+			if !added {
+				break
+			}
+		}
+	}
+	generateCreateViewsSQL(viewsToCreateNow, targetSchema, collector)
+
+	// If any views were deferred, also defer functions whose view dependency is
+	// on those deferred views — they must be created after the views exist.
+	if len(d.deferredAddedViews) > 0 {
+		deferredViewLookup := buildViewLookup(d.deferredAddedViews)
+		var keepNow []*ir.Function
+		for _, fn := range functionsWithViewDeps {
+			if functionReferencesNewView(fn, deferredViewLookup) {
+				d.functionsAwaitingDeferredViews = append(d.functionsAwaitingDeferredViews, fn)
+			} else {
+				keepNow = append(keepNow, fn)
+			}
+		}
+		functionsWithViewDeps = keepNow
+	}
 
 	// Create functions WITH view dependencies (now that views exist)
 	// These functions reference views in their return type or parameter types (issue #300)
@@ -1700,8 +1976,25 @@ func (d *ddlDiff) generateModifySQL(targetSchema string, collector *diffCollecto
 	// Modify sequences
 	generateModifySequencesSQL(d.modifiedSequences, targetSchema, collector)
 
+	// Drop foreign keys bound to unique/PK constraints being replaced, so the
+	// constraint drops below succeed; they are recreated right after (issue #439)
+	generateDropRecreatedFKsSQL(d.fkPreDrops, targetSchema, collector)
+
 	// Modify tables
-	generateModifyTablesSQL(d.modifiedTables, d.droppedTables, targetSchema, collector)
+	generateModifyTablesSQL(d.modifiedTables, d.droppedTables, d.fkPreDrops, targetSchema, collector)
+
+	// (Re)create the dependent foreign keys now that the replacement constraints exist
+	generateDeferredConstraintsSQL(d.fkPostAdds, targetSchema, collector)
+
+	// Create views deferred from generateCreateSQL — their bodies reference
+	// columns just added by ALTER TABLE above (issue #414). Likewise, emit
+	// any functions whose view dependency was on those deferred views.
+	if len(d.deferredAddedViews) > 0 {
+		generateCreateViewsSQL(d.deferredAddedViews, targetSchema, collector)
+	}
+	if len(d.functionsAwaitingDeferredViews) > 0 {
+		generateCreateFunctionsSQL(d.functionsAwaitingDeferredViews, targetSchema, collector)
+	}
 
 	// Find views that depend on views being recreated (issue #268, #308)
 	// Handles both materialized views and regular views with RequiresRecreate
@@ -1725,6 +2018,9 @@ func (d *ddlDiff) generateModifySQL(targetSchema string, collector *diffCollecto
 	// Modify procedures
 	generateModifyProceduresSQL(d.modifiedProcedures, targetSchema, collector)
 
+	// Modify aggregates (DROP + CREATE for definitional changes)
+	generateModifyAggregatesSQL(d.modifiedAggregates, targetSchema, collector)
+
 	// Modify default privileges
 	generateModifyDefaultPrivilegesSQL(d.modifiedDefaultPrivileges, targetSchema, collector)
 
@@ -1744,14 +2040,43 @@ func (d *ddlDiff) generateModifySQL(targetSchema string, collector *diffCollecto
 func (d *ddlDiff) generateDropSQL(targetSchema string, collector *diffCollector, preDroppedViews map[string]bool) {
 
 	// REVOKE privileges BEFORE dropping objects (objects must exist for REVOKE to succeed)
+	// Skip REVOKEs on relations already dropped in the pre-drop phase: REVOKE has
+	// no IF EXISTS and would fail, and dropping the relation removed its privileges.
+	// Relations share a namespace, so matching the bare name is unambiguous.
+	preDroppedNames := make(map[string]bool, len(preDroppedViews))
+	for key := range preDroppedViews {
+		if idx := strings.LastIndex(key, "."); idx >= 0 {
+			preDroppedNames[key[idx+1:]] = true
+		}
+	}
+	droppedColumnPrivileges := d.droppedColumnPrivileges
+	droppedPrivileges := d.droppedPrivileges
+	if len(preDroppedNames) > 0 {
+		droppedColumnPrivileges = nil
+		for _, cp := range d.droppedColumnPrivileges {
+			if !preDroppedNames[cp.TableName] {
+				droppedColumnPrivileges = append(droppedColumnPrivileges, cp)
+			}
+		}
+		droppedPrivileges = nil
+		for _, p := range d.droppedPrivileges {
+			if !preDroppedNames[p.ObjectName] {
+				droppedPrivileges = append(droppedPrivileges, p)
+			}
+		}
+	}
 	generateRestoreDefaultPrivilegesSQL(d.droppedRevokedDefaultPrivs, targetSchema, collector)
-	generateDropColumnPrivilegesSQL(d.droppedColumnPrivileges, targetSchema, collector)
-	generateDropPrivilegesSQL(d.droppedPrivileges, targetSchema, collector)
+	generateDropColumnPrivilegesSQL(droppedColumnPrivileges, targetSchema, collector)
+	generateDropPrivilegesSQL(droppedPrivileges, targetSchema, collector)
 	generateDropDefaultPrivilegesSQL(d.droppedDefaultPrivileges, targetSchema, collector)
 
 	// Drop triggers from modified tables and views first (triggers depend on functions)
 	generateDropTriggersFromModifiedTables(d.modifiedTables, targetSchema, collector)
-	generateDropTriggersFromModifiedViews(d.modifiedViews, targetSchema, collector)
+	generateDropTriggersFromModifiedViews(d.modifiedViews, targetSchema, collector, preDroppedViews)
+
+	// Drop aggregates before functions, since an aggregate depends on its
+	// transition/final functions (issue #416).
+	generateDropAggregatesSQL(d.droppedAggregates, targetSchema, collector)
 
 	// Drop functions
 	generateDropFunctionsSQL(d.droppedFunctions, targetSchema, collector)
@@ -2215,6 +2540,7 @@ func referencesNewFunction(expr, defaultSchema string, newFunctions map[string]s
 func (d *schemaDiff) GetObjectName() string     { return d.New.Name }
 func (d *functionDiff) GetObjectName() string   { return d.New.Name }
 func (d *procedureDiff) GetObjectName() string  { return d.New.Name }
+func (d *aggregateDiff) GetObjectName() string  { return d.New.Name }
 func (d *typeDiff) GetObjectName() string       { return d.New.Name }
 func (d *sequenceDiff) GetObjectName() string   { return d.New.Name }
 func (d *triggerDiff) GetObjectName() string    { return d.New.Name }

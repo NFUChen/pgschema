@@ -74,12 +74,12 @@ WITH column_base AS (
         COALESCE(d.description, '') AS column_comment,
         CASE
             WHEN dt.typtype = 'd' THEN
-                CASE WHEN dn.nspname = c.table_schema THEN dt.typname
-                     ELSE dn.nspname || '.' || dt.typname
+                CASE WHEN dn.nspname = c.table_schema THEN quote_ident(dt.typname)
+                     ELSE quote_ident(dn.nspname) || '.' || quote_ident(dt.typname)
                 END
             WHEN dt.typtype = 'e' OR dt.typtype = 'c' THEN
-                CASE WHEN dn.nspname = c.table_schema THEN dt.typname
-                     ELSE dn.nspname || '.' || dt.typname
+                CASE WHEN dn.nspname = c.table_schema THEN quote_ident(dt.typname)
+                     ELSE quote_ident(dn.nspname) || '.' || quote_ident(dt.typname)
                 END
             WHEN dt.typtype = 'b' AND dt.typcategory = 'A' THEN
                 -- Array types: apply same schema qualification logic to element type
@@ -88,8 +88,8 @@ WITH column_base AS (
                 -- Use format_type to preserve typmod for element types (e.g., varchar(128)[] for character varying(128)[])
                 CASE
                     WHEN en.nspname = 'pg_catalog' THEN et.typname
-                    WHEN en.nspname = c.table_schema THEN et.typname
-                    ELSE en.nspname || '.' || et.typname
+                    WHEN en.nspname = c.table_schema THEN quote_ident(et.typname)
+                    ELSE quote_ident(en.nspname) || '.' || quote_ident(et.typname)
                 END || COALESCE(substring(format_type(a.atttypid, a.atttypmod) FROM '\([^)]*\)'), '') || '[]'
             WHEN dt.typtype = 'b' THEN
                 -- Non-array base types: qualify if not in pg_catalog or table's schema
@@ -193,12 +193,12 @@ WITH column_base AS (
         COALESCE(d.description, '') AS column_comment,
         CASE
             WHEN dt.typtype = 'd' THEN
-                CASE WHEN dn.nspname = c.table_schema THEN dt.typname
-                     ELSE dn.nspname || '.' || dt.typname
+                CASE WHEN dn.nspname = c.table_schema THEN quote_ident(dt.typname)
+                     ELSE quote_ident(dn.nspname) || '.' || quote_ident(dt.typname)
                 END
             WHEN dt.typtype = 'e' OR dt.typtype = 'c' THEN
-                CASE WHEN dn.nspname = c.table_schema THEN dt.typname
-                     ELSE dn.nspname || '.' || dt.typname
+                CASE WHEN dn.nspname = c.table_schema THEN quote_ident(dt.typname)
+                     ELSE quote_ident(dn.nspname) || '.' || quote_ident(dt.typname)
                 END
             WHEN dt.typtype = 'b' AND dt.typcategory = 'A' THEN
                 -- Array types: apply same schema qualification logic to element type
@@ -207,8 +207,8 @@ WITH column_base AS (
                 -- Use format_type to preserve typmod for element types (e.g., varchar(128)[] for character varying(128)[])
                 CASE
                     WHEN en.nspname = 'pg_catalog' THEN et.typname
-                    WHEN en.nspname = c.table_schema THEN et.typname
-                    ELSE en.nspname || '.' || et.typname
+                    WHEN en.nspname = c.table_schema THEN quote_ident(et.typname)
+                    ELSE quote_ident(en.nspname) || '.' || quote_ident(et.typname)
                 END || COALESCE(substring(format_type(a.atttypid, a.atttypmod) FROM '\([^)]*\)'), '') || '[]'
             WHEN dt.typtype = 'b' THEN
                 -- Non-array base types: qualify if not in pg_catalog or table's schema
@@ -325,8 +325,8 @@ SELECT
     COALESCE(fcl.relname, '') AS foreign_table_name,
     COALESCE(fa.attname, '') AS foreign_column_name,
     COALESCE(fa.attnum, 0) AS foreign_ordinal_position,
-    CASE WHEN c.contype = 'c' THEN pg_get_constraintdef(c.oid, true) ELSE NULL END AS check_clause,
-    CASE WHEN c.contype = 'x' THEN pg_get_constraintdef(c.oid, true) ELSE NULL END AS exclusion_definition,
+    cd.check_clause,
+    cd.exclusion_definition,
     CASE c.confdeltype
         WHEN 'a' THEN 'NO ACTION'
         WHEN 'r' THEN 'RESTRICT'
@@ -355,9 +355,23 @@ LEFT JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = ANY(c.conkey)
 LEFT JOIN pg_class fcl ON c.confrelid = fcl.oid
 LEFT JOIN pg_namespace fn ON fcl.relnamespace = fn.oid
 LEFT JOIN pg_attribute fa ON fa.attrelid = c.confrelid AND fa.attnum = c.confkey[array_position(c.conkey, a.attnum)]
+LEFT JOIN LATERAL (
+    SELECT
+        -- Render with search_path set to the table's own schema so same-schema
+        -- type/function references come out unqualified while cross-schema
+        -- references stay qualified. This matches how the desired state renders
+        -- in its temporary schema, keeping both sides comparable (issue #449).
+        set_config('search_path', quote_ident(n.nspname), true) AS dummy,
+        CASE WHEN c.contype = 'c' THEN pg_get_constraintdef(c.oid, true) ELSE NULL END AS check_clause,
+        CASE WHEN c.contype = 'x' THEN pg_get_constraintdef(c.oid, true) ELSE NULL END AS exclusion_definition
+) cd ON true
 WHERE n.nspname NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
     AND n.nspname NOT LIKE 'pg_temp_%'
     AND n.nspname NOT LIKE 'pg_toast_temp_%'
+    -- Skip internal per-partition FK rows (conparentid != 0) that PostgreSQL
+    -- creates when a FK references a partitioned table. pg_dump omits these;
+    -- only the top-level FK (conparentid = 0) is a real, dumpable constraint.
+    AND (c.contype <> 'f' OR c.conparentid = 0)
 ORDER BY n.nspname, cl.relname, c.contype, c.conname, a.attnum;
 
 -- GetIndexes retrieves all indexes including regular and unique indexes created with CREATE INDEX
@@ -764,22 +778,51 @@ WHERE
 ORDER BY n.nspname, c.relname;
 
 -- GetRLSPolicies retrieves all row level security policies
+-- This replicates the pg_policies system view but computes the qual/with_check
+-- expressions with a forced search_path so qualification is deterministic:
+-- 1. set_config sets search_path to only the table's own schema
+-- 2. pg_get_expr then renders same-schema references unqualified while cross-schema
+--    references (e.g. Supabase's auth.uid(), issue #427) stay qualified. Without this,
+--    rendering depends on the session search_path and the current/desired states
+--    compare differently (issue #449).
 -- name: GetRLSPolicies :many
-SELECT 
-    schemaname,
-    tablename,
-    policyname,
-    permissive,
-    roles,
-    cmd,
-    qual,
-    with_check
-FROM pg_policies
-WHERE 
-    schemaname NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
-    AND schemaname NOT LIKE 'pg_temp_%'
-    AND schemaname NOT LIKE 'pg_toast_temp_%'
-ORDER BY schemaname, tablename, policyname;
+SELECT
+    n.nspname AS schemaname,
+    c.relname AS tablename,
+    pol.polname AS policyname,
+    CASE WHEN pol.polpermissive THEN 'PERMISSIVE' ELSE 'RESTRICTIVE' END AS permissive,
+    CASE
+        WHEN pol.polroles = '{0}'::oid[] THEN ARRAY['public']
+        ELSE ARRAY(
+            SELECT r.rolname
+            FROM pg_catalog.pg_roles r
+            WHERE r.oid = ANY (pol.polroles)
+            ORDER BY r.rolname
+        )
+    END AS roles,
+    CASE pol.polcmd
+        WHEN 'r' THEN 'SELECT'
+        WHEN 'a' THEN 'INSERT'
+        WHEN 'w' THEN 'UPDATE'
+        WHEN 'd' THEN 'DELETE'
+        WHEN '*' THEN 'ALL'
+    END AS cmd,
+    CASE WHEN pol.polqual IS NULL THEN NULL ELSE e.qual END AS qual,
+    CASE WHEN pol.polwithcheck IS NULL THEN NULL ELSE e.with_check END AS with_check
+FROM pg_catalog.pg_policy pol
+JOIN pg_catalog.pg_class c ON c.oid = pol.polrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN LATERAL (
+    SELECT
+        set_config('search_path', quote_ident(n.nspname), true) AS dummy,
+        pg_get_expr(pol.polqual, pol.polrelid) AS qual,
+        pg_get_expr(pol.polwithcheck, pol.polrelid) AS with_check
+) e ON true
+WHERE
+    n.nspname NOT IN ('information_schema', 'pg_catalog', 'pg_toast')
+    AND n.nspname NOT LIKE 'pg_temp_%'
+    AND n.nspname NOT LIKE 'pg_toast_temp_%'
+ORDER BY n.nspname, c.relname, pol.polname;
 
 -- GetRLSTablesForSchema retrieves tables with row level security enabled for a specific schema
 -- name: GetRLSTablesForSchema :many
@@ -797,20 +840,49 @@ WHERE
 ORDER BY n.nspname, c.relname;
 
 -- GetRLSPoliciesForSchema retrieves all row level security policies for a specific schema
+-- See GetRLSPolicies for why qual/with_check are computed under a forced pg_catalog
+-- search_path (Issue #427).
 -- name: GetRLSPoliciesForSchema :many
-SELECT 
-    schemaname,
-    tablename,
-    policyname,
-    permissive,
-    roles,
-    cmd,
-    qual,
-    with_check
-FROM pg_policies
-WHERE 
-    schemaname = $1
-ORDER BY schemaname, tablename, policyname;
+SELECT
+    n.nspname AS schemaname,
+    c.relname AS tablename,
+    pol.polname AS policyname,
+    CASE WHEN pol.polpermissive THEN 'PERMISSIVE' ELSE 'RESTRICTIVE' END AS permissive,
+    CASE
+        WHEN pol.polroles = '{0}'::oid[] THEN ARRAY['public']
+        ELSE ARRAY(
+            SELECT r.rolname
+            FROM pg_catalog.pg_roles r
+            WHERE r.oid = ANY (pol.polroles)
+            ORDER BY r.rolname
+        )
+    END AS roles,
+    CASE pol.polcmd
+        WHEN 'r' THEN 'SELECT'
+        WHEN 'a' THEN 'INSERT'
+        WHEN 'w' THEN 'UPDATE'
+        WHEN 'd' THEN 'DELETE'
+        WHEN '*' THEN 'ALL'
+    END AS cmd,
+    CASE WHEN pol.polqual IS NULL THEN NULL ELSE e.qual END AS qual,
+    CASE WHEN pol.polwithcheck IS NULL THEN NULL ELSE e.with_check END AS with_check
+FROM pg_catalog.pg_policy pol
+JOIN pg_catalog.pg_class c ON c.oid = pol.polrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN LATERAL (
+    SELECT
+        -- Render with search_path set to the table's own schema so same-schema
+        -- references come out unqualified while cross-schema references (e.g.
+        -- Supabase's auth.uid(), issue #427) stay qualified. This matches how the
+        -- desired state renders in its temporary schema, so both sides compare
+        -- equal without regex-stripping qualifiers afterwards (issue #449).
+        set_config('search_path', quote_ident(n.nspname), true) AS dummy,
+        pg_get_expr(pol.polqual, pol.polrelid) AS qual,
+        pg_get_expr(pol.polwithcheck, pol.polrelid) AS with_check
+) e ON true
+WHERE
+    n.nspname = $1
+ORDER BY n.nspname, c.relname, pol.polname;
 
 -- GetDomains retrieves all user-defined domains
 -- name: GetDomains :many
@@ -912,8 +984,8 @@ SELECT
     COALESCE(fcl.relname, '') AS foreign_table_name,
     COALESCE(fa.attname, '') AS foreign_column_name,
     COALESCE(fa.attnum, 0) AS foreign_ordinal_position,
-    CASE WHEN c.contype = 'c' THEN pg_get_constraintdef(c.oid, true) ELSE NULL END AS check_clause,
-    CASE WHEN c.contype = 'x' THEN pg_get_constraintdef(c.oid, true) ELSE NULL END AS exclusion_definition,
+    cd.check_clause,
+    cd.exclusion_definition,
     CASE c.confdeltype
         WHEN 'a' THEN 'NO ACTION'
         WHEN 'r' THEN 'RESTRICT'
@@ -946,7 +1018,21 @@ LEFT JOIN pg_class fcl ON c.confrelid = fcl.oid
 LEFT JOIN pg_namespace fn ON fcl.relnamespace = fn.oid
 LEFT JOIN pg_attribute fa ON fa.attrelid = c.confrelid AND fa.attnum = c.confkey[array_position(c.conkey, a.attnum)]
 LEFT JOIN pg_index i ON i.indexrelid = c.conindid
+LEFT JOIN LATERAL (
+    SELECT
+        -- Render with search_path set to the table's own schema so same-schema
+        -- type/function references come out unqualified while cross-schema
+        -- references stay qualified. This matches how the desired state renders
+        -- in its temporary schema, keeping both sides comparable (issue #449).
+        set_config('search_path', quote_ident(n.nspname), true) AS dummy,
+        CASE WHEN c.contype = 'c' THEN pg_get_constraintdef(c.oid, true) ELSE NULL END AS check_clause,
+        CASE WHEN c.contype = 'x' THEN pg_get_constraintdef(c.oid, true) ELSE NULL END AS exclusion_definition
+) cd ON true
 WHERE n.nspname = $1
+    -- Skip internal per-partition FK rows (conparentid != 0) that PostgreSQL
+    -- creates when a FK references a partitioned table. pg_dump omits these;
+    -- only the top-level FK (conparentid = 0) is a real, dumpable constraint.
+    AND (c.contype <> 'f' OR c.conparentid = 0)
 ORDER BY n.nspname, cl.relname, c.contype, c.conname, a.attnum;
 
 -- GetSequencesForSchema retrieves all sequences for a specific schema
@@ -972,12 +1058,18 @@ LEFT JOIN pg_class dep_table ON d.refobjid = dep_table.oid
 LEFT JOIN pg_attribute dep_col ON dep_col.attrelid = dep_table.oid AND dep_col.attnum = d.refobjsubid
 -- Method 2: Find sequences used in column defaults (for nextval() patterns)
 LEFT JOIN (
-    SELECT 
+    SELECT
         col.table_name,
         col.column_name,
-        REGEXP_REPLACE(
-            REGEXP_REPLACE(col.column_default, 'nextval\(''([^'']+)''.*\)', '\1'),
-            '^[^.]*\.', ''
+        REPLACE(
+            REGEXP_REPLACE(
+                REGEXP_REPLACE(
+                    REGEXP_REPLACE(col.column_default, 'nextval\(''([^'']+)''.*\)', '\1'),
+                    '^("([^"]|"")*"\.|[^.]*\.)', ''
+                ),
+                '^"(.*)"$', '\1'
+            ),
+            '""', '"'
         ) AS sequence_name
     FROM information_schema.columns col
     WHERE col.table_schema = $1
@@ -1052,25 +1144,60 @@ WHERE r.routine_schema = $1
     AND d.objid IS NULL  -- Exclude procedures that are extension members
 ORDER BY r.routine_schema, r.routine_name;
 
--- GetAggregatesForSchema retrieves all user-defined aggregates for a specific schema
+-- GetAggregatesForSchema retrieves all user-defined aggregates for a specific schema.
+-- Support-function references (SFUNC, FINALFUNC, COMBINEFUNC, ...) are pre-quoted and
+-- schema-qualified only when they live in a different schema than the aggregate, so the
+-- desired/current IR keys line up and the plan normalizer never has to rewrite them.
 -- name: GetAggregatesForSchema :many
-SELECT 
+SELECT
     n.nspname AS aggregate_schema,
     p.proname AS aggregate_name,
-    pg_get_function_arguments(p.oid) AS aggregate_signature,
-    oidvectortypes(p.proargtypes) AS aggregate_arguments,
+    a.aggkind AS aggregate_kind,                                  -- 'n' normal, 'o' ordered-set, 'h' hypothetical-set
+    pg_get_function_arguments(p.oid) AS aggregate_signature,      -- aggregate-aware: emits ORDER BY for ordered/hypothetical
+    pg_get_function_identity_arguments(p.oid) AS aggregate_identity_args,
     format_type(p.prorettype, NULL) AS aggregate_return_type,
-    -- Get transition function
-    COALESCE(tf.proname, '') AS transition_function,
-    COALESCE(tfn.nspname, '') AS transition_function_schema,
-    -- Get state type
+    p.proparallel AS parallel,                                    -- 's' safe, 'r' restricted, 'u' unsafe (default)
+    -- Transition function and state
+    CASE WHEN tfn.nspname = n.nspname THEN quote_ident(tf.proname)
+         ELSE quote_ident(tfn.nspname) || '.' || quote_ident(tf.proname) END AS transition_function,
     format_type(a.aggtranstype, NULL) AS state_type,
-    -- Get initial condition
+    a.aggtransspace AS state_space,
     a.agginitval AS initial_condition,
-    -- Get final function if exists
-    COALESCE(ff.proname, '') AS final_function,
-    COALESCE(ffn.nspname, '') AS final_function_schema,
-    -- Comment
+    -- Final function
+    CASE WHEN a.aggfinalfn = 0 THEN ''
+         WHEN ffn.nspname = n.nspname THEN quote_ident(ff.proname)
+         ELSE quote_ident(ffn.nspname) || '.' || quote_ident(ff.proname) END AS final_function,
+    a.aggfinalextra AS final_func_extra,
+    a.aggfinalmodify AS final_func_modify,                        -- 'r' read_only (default), 's' shareable, 'w' read_write
+    -- Parallel-aggregation support functions
+    CASE WHEN a.aggcombinefn = 0 THEN ''
+         WHEN cfn.nspname = n.nspname THEN quote_ident(cf.proname)
+         ELSE quote_ident(cfn.nspname) || '.' || quote_ident(cf.proname) END AS combine_function,
+    CASE WHEN a.aggserialfn = 0 THEN ''
+         WHEN sfn.nspname = n.nspname THEN quote_ident(sf.proname)
+         ELSE quote_ident(sfn.nspname) || '.' || quote_ident(sf.proname) END AS serial_function,
+    CASE WHEN a.aggdeserialfn = 0 THEN ''
+         WHEN dfn.nspname = n.nspname THEN quote_ident(df.proname)
+         ELSE quote_ident(dfn.nspname) || '.' || quote_ident(df.proname) END AS deserial_function,
+    -- Moving-aggregate support functions and state
+    CASE WHEN a.aggmtransfn = 0 THEN ''
+         WHEN mtfn.nspname = n.nspname THEN quote_ident(mtf.proname)
+         ELSE quote_ident(mtfn.nspname) || '.' || quote_ident(mtf.proname) END AS mtransition_function,
+    CASE WHEN a.aggminvtransfn = 0 THEN ''
+         WHEN mitfn.nspname = n.nspname THEN quote_ident(mitf.proname)
+         ELSE quote_ident(mitfn.nspname) || '.' || quote_ident(mitf.proname) END AS minv_transition_function,
+    CASE WHEN a.aggmtransfn = 0 THEN '' ELSE format_type(a.aggmtranstype, NULL) END AS mstate_type,
+    a.aggmtransspace AS mstate_space,
+    CASE WHEN a.aggmfinalfn = 0 THEN ''
+         WHEN mffn.nspname = n.nspname THEN quote_ident(mff.proname)
+         ELSE quote_ident(mffn.nspname) || '.' || quote_ident(mff.proname) END AS mfinal_function,
+    a.aggmfinalextra AS mfinal_func_extra,
+    a.aggmfinalmodify AS mfinal_func_modify,
+    a.aggminitval AS minitial_condition,
+    -- Sort operator (only meaningful for normal aggregates)
+    CASE WHEN a.aggsortop = 0 THEN ''
+         WHEN opn.nspname = n.nspname THEN format('OPERATOR(%s)', op.oprname)
+         ELSE format('OPERATOR(%s.%s)', quote_ident(opn.nspname), op.oprname) END AS sort_operator,
     COALESCE(d.description, '') AS aggregate_comment
 FROM pg_proc p
 JOIN pg_namespace n ON p.pronamespace = n.oid
@@ -1079,11 +1206,25 @@ LEFT JOIN pg_proc tf ON a.aggtransfn = tf.oid
 LEFT JOIN pg_namespace tfn ON tf.pronamespace = tfn.oid
 LEFT JOIN pg_proc ff ON a.aggfinalfn = ff.oid
 LEFT JOIN pg_namespace ffn ON ff.pronamespace = ffn.oid
-LEFT JOIN pg_description d ON d.objoid = p.oid AND d.classoid = 'pg_proc'::regclass
+LEFT JOIN pg_proc cf ON a.aggcombinefn = cf.oid
+LEFT JOIN pg_namespace cfn ON cf.pronamespace = cfn.oid
+LEFT JOIN pg_proc sf ON a.aggserialfn = sf.oid
+LEFT JOIN pg_namespace sfn ON sf.pronamespace = sfn.oid
+LEFT JOIN pg_proc df ON a.aggdeserialfn = df.oid
+LEFT JOIN pg_namespace dfn ON df.pronamespace = dfn.oid
+LEFT JOIN pg_proc mtf ON a.aggmtransfn = mtf.oid
+LEFT JOIN pg_namespace mtfn ON mtf.pronamespace = mtfn.oid
+LEFT JOIN pg_proc mitf ON a.aggminvtransfn = mitf.oid
+LEFT JOIN pg_namespace mitfn ON mitf.pronamespace = mitfn.oid
+LEFT JOIN pg_proc mff ON a.aggmfinalfn = mff.oid
+LEFT JOIN pg_namespace mffn ON mff.pronamespace = mffn.oid
+LEFT JOIN pg_operator op ON op.oid = a.aggsortop
+LEFT JOIN pg_namespace opn ON op.oprnamespace = opn.oid
+LEFT JOIN pg_description d ON d.objoid = p.oid AND d.classoid = 'pg_proc'::regclass AND d.objsubid = 0
 WHERE p.prokind = 'a'  -- Only aggregates
     AND n.nspname = $1
     AND NOT EXISTS (
-        SELECT 1 FROM pg_depend dep 
+        SELECT 1 FROM pg_depend dep
         WHERE dep.objid = p.oid AND dep.deptype = 'e'
     )  -- Exclude extension members
 ORDER BY n.nspname, p.proname;

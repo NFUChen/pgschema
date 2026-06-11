@@ -504,6 +504,13 @@ func (i *Inspector) buildConstraints(ctx context.Context, schema *IR, targetSche
 		schemaName := constraint.TableSchema
 		tableName := constraint.TableName
 		constraintName := constraint.ConstraintName
+
+		// Skip ignored constraints early to avoid the per-column position
+		// queries below for constraints that would be discarded anyway.
+		if i.ignoreConfig != nil && i.ignoreConfig.ShouldIgnoreConstraint(constraintName) {
+			continue
+		}
+
 		constraintType := ""
 		if constraint.ConstraintType.Valid {
 			constraintType = constraint.ConstraintType.String
@@ -559,6 +566,14 @@ func (i *Inspector) buildConstraints(ctx context.Context, schema *IR, targetSche
 				NullsNotDistinct: constraint.NullsNotDistinct.Bool, // PG15+ UNIQUE NULLS NOT DISTINCT
 			}
 
+			// Handle deferrable attributes. PRIMARY KEY, UNIQUE, FOREIGN KEY, and
+			// EXCLUDE constraints can all be DEFERRABLE; CHECK constraints cannot
+			// (condeferrable is always false for them). EXCLUDE carries the clause
+			// in its full pg_get_constraintdef() text, but we still record the
+			// fields so constraint comparison stays uniform across types.
+			c.Deferrable = constraint.Deferrable
+			c.InitiallyDeferred = constraint.InitiallyDeferred
+
 			// Handle foreign key references
 			if cType == ConstraintTypeForeignKey {
 				if refSchema := i.safeInterfaceToString(constraint.ForeignTableSchema); refSchema != "" && refSchema != "<nil>" {
@@ -573,9 +588,6 @@ func (i *Inspector) buildConstraints(ctx context.Context, schema *IR, targetSche
 				if updateRule := i.safeInterfaceToString(constraint.UpdateRule); updateRule != "" && updateRule != "<nil>" {
 					c.UpdateRule = updateRule
 				}
-				// Handle deferrable attributes for foreign key constraints
-				c.Deferrable = constraint.Deferrable
-				c.InitiallyDeferred = constraint.InitiallyDeferred
 			}
 
 			// Handle check constraints
@@ -885,6 +897,10 @@ func (i *Inspector) buildIndexes(ctx context.Context, schema *IR, targetSchema s
 
 		// Add index to table or materialized view
 		if table, exists := dbSchema.Tables[tableName]; exists {
+			// Track whether the index targets a partitioned parent. PostgreSQL does
+			// not allow CREATE INDEX CONCURRENTLY on partitioned parents, so the
+			// online rewrite must emit a synchronous CREATE INDEX for these.
+			index.IsPartitioned = table.IsPartitioned
 			table.Indexes[indexName] = index
 		} else if view, exists := dbSchema.Views[tableName]; exists && view.Materialized {
 			// Initialize Indexes map if nil
@@ -1389,34 +1405,70 @@ func (i *Inspector) buildAggregates(ctx context.Context, schema *IR, targetSchem
 	for _, agg := range aggregates {
 		schemaName := agg.AggregateSchema
 		aggregateName := agg.AggregateName
-		comment := ""
-		if agg.AggregateComment.Valid {
-			comment = agg.AggregateComment.String
+
+		// Identity args (types only) drive the DROP/COMMENT signature and the overload key.
+		identityArgs := i.safeInterfaceToString(agg.AggregateIdentityArgs)
+
+		// agginitval/aggminitval are nullable: preserve NULL (nil) vs explicit '' so an
+		// INITCOND/MINITCOND of empty string is not silently dropped.
+		var initialCondition *string
+		if agg.InitialCondition.Valid {
+			v := agg.InitialCondition.String
+			initialCondition = &v
 		}
-		returnType := i.safeInterfaceToString(agg.AggregateReturnType)
-		transitionFunction := i.safeInterfaceToString(agg.TransitionFunction)
-		transitionFunctionSchema := i.safeInterfaceToString(agg.TransitionFunctionSchema)
-		stateType := i.safeInterfaceToString(agg.StateType)
-		initialCondition := i.safeInterfaceToString(agg.InitialCondition)
-		finalFunction := i.safeInterfaceToString(agg.FinalFunction)
-		finalFunctionSchema := i.safeInterfaceToString(agg.FinalFunctionSchema)
+		var minitialCondition *string
+		if agg.MinitialCondition.Valid {
+			v := agg.MinitialCondition.String
+			minitialCondition = &v
+		}
 
 		dbSchema := schema.getOrCreateSchema(schemaName)
 
 		aggregate := &Aggregate{
-			Schema:                   schemaName,
-			Name:                     aggregateName,
-			ReturnType:               returnType,
-			TransitionFunction:       transitionFunction,
-			TransitionFunctionSchema: transitionFunctionSchema,
-			StateType:                stateType,
-			InitialCondition:         initialCondition,
-			FinalFunction:            finalFunction,
-			FinalFunctionSchema:      finalFunctionSchema,
-			Comment:                  comment,
+			Schema:     schemaName,
+			Name:       aggregateName,
+			Arguments:  identityArgs,
+			Signature:  i.safeInterfaceToString(agg.AggregateSignature),
+			Kind:       i.safeInterfaceToString(agg.AggregateKind),
+			ReturnType: i.safeInterfaceToString(agg.AggregateReturnType),
+			Parallel:   i.safeInterfaceToString(agg.Parallel),
+
+			TransitionFunction: i.safeInterfaceToString(agg.TransitionFunction),
+			StateType:          i.safeInterfaceToString(agg.StateType),
+			StateSpace:         int(agg.StateSpace),
+			InitialCondition:   initialCondition,
+
+			FinalFunction:   i.safeInterfaceToString(agg.FinalFunction),
+			FinalFuncExtra:  agg.FinalFuncExtra,
+			FinalFuncModify: i.safeInterfaceToString(agg.FinalFuncModify),
+
+			CombineFunction:  i.safeInterfaceToString(agg.CombineFunction),
+			SerialFunction:   i.safeInterfaceToString(agg.SerialFunction),
+			DeserialFunction: i.safeInterfaceToString(agg.DeserialFunction),
+
+			MTransitionFunction:    i.safeInterfaceToString(agg.MtransitionFunction),
+			MInvTransitionFunction: i.safeInterfaceToString(agg.MinvTransitionFunction),
+			MStateType:             i.safeInterfaceToString(agg.MstateType),
+			MStateSpace:            int(agg.MstateSpace),
+			MFinalFunction:         i.safeInterfaceToString(agg.MfinalFunction),
+			MFinalFuncExtra:        agg.MfinalFuncExtra,
+			MFinalFuncModify:       i.safeInterfaceToString(agg.MfinalFuncModify),
+			MInitialCondition:      minitialCondition,
+
+			SortOperator: i.safeInterfaceToString(agg.SortOperator),
+
+			Comment: i.safeInterfaceToString(agg.AggregateComment),
 		}
 
-		dbSchema.SetAggregate(aggregateName, aggregate)
+		// Check if aggregate should be ignored
+		if i.ignoreConfig != nil && i.ignoreConfig.ShouldIgnoreAggregate(aggregateName) {
+			continue
+		}
+
+		// Use name(arguments) as key to support aggregate overloading,
+		// mirroring how functions and procedures are keyed.
+		aggregateKey := aggregateName + "(" + identityArgs + ")"
+		dbSchema.SetAggregate(aggregateKey, aggregate)
 	}
 
 	return nil
@@ -1647,6 +1699,13 @@ func (i *Inspector) buildTriggers(ctx context.Context, schema *IR, targetSchema 
 		schemaName := triggerRow.TriggerSchema
 		triggerName := triggerRow.TriggerName
 
+		// Check if the trigger should be ignored (e.g. triggers that an extension
+		// automatically creates on tracked tables). Ignored triggers are excluded
+		// from dump, plan generation, and drift detection alike.
+		if i.ignoreConfig != nil && i.ignoreConfig.ShouldIgnoreTrigger(triggerName) {
+			continue
+		}
+
 		// Find where to store this trigger: table, view, or ignored external table
 		targetDBSchema := schema.getOrCreateSchema(schemaName)
 		var triggerMap map[string]*Trigger
@@ -1817,25 +1876,16 @@ func (i *Inspector) buildRLSPolicies(ctx context.Context, schema *IR, targetSche
 	}
 
 	// Get RLS policies for the target schema
-	policies, err := i.queries.GetRLSPoliciesForSchema(ctx, sql.NullString{String: targetSchema, Valid: true})
+	policies, err := i.queries.GetRLSPoliciesForSchema(ctx, targetSchema)
 	if err != nil {
 		return err
 	}
 
 	// Process policies
 	for _, policyRow := range policies {
-		schemaName := ""
-		if policyRow.Schemaname.Valid {
-			schemaName = policyRow.Schemaname.String
-		}
-		tableName := ""
-		if policyRow.Tablename.Valid {
-			tableName = policyRow.Tablename.String
-		}
-		policyName := ""
-		if policyRow.Policyname.Valid {
-			policyName = policyRow.Policyname.String
-		}
+		schemaName := policyRow.Schemaname
+		tableName := policyRow.Tablename
+		policyName := policyRow.Policyname
 
 		var pCommand PolicyCommand
 		if policyRow.Cmd.Valid {
@@ -1858,10 +1908,7 @@ func (i *Inspector) buildRLSPolicies(ctx context.Context, schema *IR, targetSche
 		}
 
 		// Determine if policy is permissive
-		permissive := true // Default
-		if policyRow.Permissive.Valid {
-			permissive = policyRow.Permissive.String == "PERMISSIVE"
-		}
+		permissive := policyRow.Permissive == "PERMISSIVE"
 
 		policy := &RLSPolicy{
 			Schema:     schemaName,

@@ -2,8 +2,10 @@ package util
 
 import (
 	"os"
+	"path/filepath"
 
 	"github.com/BurntSushi/toml"
+	"github.com/pgplex/pgschema/internal/logger"
 	"github.com/pgplex/pgschema/ir"
 )
 
@@ -32,9 +34,12 @@ type TomlConfig struct {
 	Views             ViewIgnoreConfig             `toml:"views,omitempty"`
 	Functions         FunctionIgnoreConfig         `toml:"functions,omitempty"`
 	Procedures        ProcedureIgnoreConfig        `toml:"procedures,omitempty"`
+	Aggregates        AggregateIgnoreConfig        `toml:"aggregates,omitempty"`
 	Types             TypeIgnoreConfig             `toml:"types,omitempty"`
 	Sequences         SequenceIgnoreConfig         `toml:"sequences,omitempty"`
 	Indexes           IndexIgnoreConfig            `toml:"indexes,omitempty"`
+	Constraints       ConstraintIgnoreConfig       `toml:"constraints,omitempty"`
+	Triggers          TriggerIgnoreConfig          `toml:"triggers,omitempty"`
 	Privileges        PrivilegeIgnoreConfig        `toml:"privileges,omitempty"`
 	DefaultPrivileges DefaultPrivilegeIgnoreConfig `toml:"default_privileges,omitempty"`
 }
@@ -59,6 +64,11 @@ type ProcedureIgnoreConfig struct {
 	Patterns []string `toml:"patterns,omitempty"`
 }
 
+// AggregateIgnoreConfig represents aggregate-specific ignore configuration
+type AggregateIgnoreConfig struct {
+	Patterns []string `toml:"patterns,omitempty"`
+}
+
 // TypeIgnoreConfig represents type-specific ignore configuration
 type TypeIgnoreConfig struct {
 	Patterns []string `toml:"patterns,omitempty"`
@@ -71,6 +81,18 @@ type SequenceIgnoreConfig struct {
 
 // IndexIgnoreConfig represents index-specific ignore configuration
 type IndexIgnoreConfig struct {
+	Patterns []string `toml:"patterns,omitempty"`
+}
+
+// ConstraintIgnoreConfig represents constraint-specific ignore configuration
+// Patterns match on constraint names
+type ConstraintIgnoreConfig struct {
+	Patterns []string `toml:"patterns,omitempty"`
+}
+
+// TriggerIgnoreConfig represents trigger-specific ignore configuration
+// Patterns match on trigger names
+type TriggerIgnoreConfig struct {
 	Patterns []string `toml:"patterns,omitempty"`
 }
 
@@ -94,9 +116,18 @@ func LoadIgnoreFileWithStructure() (*ir.IgnoreConfig, error) {
 
 // LoadIgnoreFileWithStructureFromPath loads an ignore file using structured format from the specified path
 func LoadIgnoreFileWithStructureFromPath(filePath string) (*ir.IgnoreConfig, error) {
+	// Resolve to an absolute path so the diagnostic logs below unambiguously
+	// show where pgschema looked (e.g. when running from the wrong directory).
+	absPath, err := filepath.Abs(filePath)
+	if err != nil {
+		absPath = filePath
+	}
+
 	// Check if file exists
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		// File doesn't exist, return nil config (no filtering)
+		// File doesn't exist, return nil config (no filtering).
+		logger.Get().Info("no ignore file found, no filtering applied",
+			"file", absPath)
 		return nil, nil
 	} else if err != nil {
 		// Other error accessing file
@@ -109,15 +140,20 @@ func LoadIgnoreFileWithStructureFromPath(filePath string) (*ir.IgnoreConfig, err
 		return nil, err
 	}
 
+	logger.Get().Debug("loaded ignore file", "file", absPath)
+
 	// Convert to simple IgnoreConfig structure
 	config := &ir.IgnoreConfig{
 		Tables:            tomlConfig.Tables.Patterns,
 		Views:             tomlConfig.Views.Patterns,
 		Functions:         tomlConfig.Functions.Patterns,
 		Procedures:        tomlConfig.Procedures.Patterns,
+		Aggregates:        tomlConfig.Aggregates.Patterns,
 		Types:             tomlConfig.Types.Patterns,
 		Sequences:         tomlConfig.Sequences.Patterns,
 		Indexes:           tomlConfig.Indexes.Patterns,
+		Constraints:       tomlConfig.Constraints.Patterns,
+		Triggers:          tomlConfig.Triggers.Patterns,
 		Privileges:        tomlConfig.Privileges.Patterns,
 		DefaultPrivileges: tomlConfig.DefaultPrivileges.Patterns,
 	}

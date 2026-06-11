@@ -28,7 +28,7 @@ type Schema struct {
 	Views                    map[string]*View           `json:"views"`                                // view_name -> View
 	Functions                map[string]*Function       `json:"functions"`                            // function_name -> Function
 	Procedures               map[string]*Procedure      `json:"procedures"`                           // procedure_name -> Procedure
-	Aggregates               map[string]*Aggregate      `json:"aggregates"`                           // aggregate_name -> Aggregate
+	Aggregates               map[string]*Aggregate      `json:"aggregates"`                           // "name(arguments)" -> Aggregate (keyed by signature for overloading)
 	Sequences                map[string]*Sequence       `json:"sequences"`                            // sequence_name -> Sequence
 	Types                    map[string]*Type           `json:"types"`                                // type_name -> Type
 	DefaultPrivileges        []*DefaultPrivilege        `json:"default_privileges,omitempty"`         // Default privileges for future objects
@@ -260,6 +260,7 @@ type Index struct {
 	IsExpression     bool           `json:"is_expression"`                // functional/expression index
 	Where            string         `json:"where,omitempty"`              // partial index condition
 	NullsNotDistinct bool           `json:"nulls_not_distinct,omitempty"` // NULLS NOT DISTINCT (PG15+)
+	IsPartitioned    bool           `json:"is_partitioned,omitempty"`     // index target is a partitioned parent (relkind 'p')
 	Comment          string         `json:"comment,omitempty"`
 }
 
@@ -386,18 +387,54 @@ type Type struct {
 	Constraints []*DomainConstraint `json:"constraints,omitempty"` // For DOMAIN types
 }
 
-// Aggregate represents a database aggregate function
+// Aggregate represents a database aggregate function.
+//
+// Support-function references (TransitionFunction, FinalFunction, ...) are stored
+// pre-quoted and schema-qualified only when they live in a different schema than the
+// aggregate itself (see GetAggregatesForSchema). They are therefore emitted verbatim in
+// the generated DDL and need no schema normalization.
 type Aggregate struct {
-	Schema                   string `json:"schema"`
-	Name                     string `json:"name"`
-	ReturnType               string `json:"return_type"`
-	TransitionFunction       string `json:"transition_function"`
-	TransitionFunctionSchema string `json:"transition_function_schema,omitempty"`
-	StateType                string `json:"state_type"`
-	InitialCondition         string `json:"initial_condition,omitempty"`
-	FinalFunction            string `json:"final_function,omitempty"`
-	FinalFunctionSchema      string `json:"final_function_schema,omitempty"`
-	Comment                  string `json:"comment,omitempty"`
+	Schema     string `json:"schema"`
+	Name       string `json:"name"`
+	Arguments  string `json:"arguments,omitempty"` // identity arg types (for DROP/COMMENT and the overload key)
+	Signature  string `json:"signature,omitempty"` // full arg list incl. ORDER BY for ordered-set (for CREATE)
+	Kind       string `json:"kind,omitempty"`      // 'n' normal, 'o' ordered-set, 'h' hypothetical-set
+	ReturnType string `json:"return_type"`
+	Parallel   string `json:"parallel,omitempty"` // 's' safe, 'r' restricted, 'u' unsafe (default)
+
+	// Transition (state) function and state value
+	TransitionFunction string `json:"transition_function"`
+	StateType          string `json:"state_type"`
+	StateSpace         int    `json:"state_space,omitempty"`
+	// InitialCondition is a pointer so a genuine NULL agginitval (nil) is distinct from
+	// an explicit empty-string initial condition (INITCOND = ''), which are semantically
+	// different in PostgreSQL.
+	InitialCondition *string `json:"initial_condition,omitempty"`
+
+	// Final function
+	FinalFunction   string `json:"final_function,omitempty"`
+	FinalFuncExtra  bool   `json:"final_func_extra,omitempty"`
+	FinalFuncModify string `json:"final_func_modify,omitempty"` // 'r' read_only (default), 's' shareable, 'w' read_write
+
+	// Parallel-aggregation support functions
+	CombineFunction  string `json:"combine_function,omitempty"`
+	SerialFunction   string `json:"serial_function,omitempty"`
+	DeserialFunction string `json:"deserial_function,omitempty"`
+
+	// Moving-aggregate support functions and state
+	MTransitionFunction    string  `json:"mtransition_function,omitempty"`
+	MInvTransitionFunction string  `json:"minv_transition_function,omitempty"`
+	MStateType             string  `json:"mstate_type,omitempty"`
+	MStateSpace            int     `json:"mstate_space,omitempty"`
+	MFinalFunction         string  `json:"mfinal_function,omitempty"`
+	MFinalFuncExtra        bool    `json:"mfinal_func_extra,omitempty"`
+	MFinalFuncModify       string  `json:"mfinal_func_modify,omitempty"`
+	MInitialCondition      *string `json:"minitial_condition,omitempty"` // pointer: nil NULL vs explicit '' (see InitialCondition)
+
+	// Sort operator (preformatted as OPERATOR(...); only meaningful for normal aggregates)
+	SortOperator string `json:"sort_operator,omitempty"`
+
+	Comment string `json:"comment,omitempty"`
 }
 
 // Procedure represents a database procedure
@@ -714,4 +751,5 @@ func (p *Procedure) GetObjectName() string  { return p.Name }
 func (v *View) GetObjectName() string       { return v.Name }
 func (s *Sequence) GetObjectName() string   { return s.Name }
 func (t *Type) GetObjectName() string       { return t.Name }
+func (a *Aggregate) GetObjectName() string  { return a.Name }
 func (e *Extension) GetObjectName() string  { return e.Name }
