@@ -8,6 +8,7 @@ import (
 
 	"github.com/pgplex/pgschema/internal/diff"
 	"github.com/pgplex/pgschema/internal/fingerprint"
+	"github.com/pgplex/pgschema/ir"
 )
 
 func TestPlan_AddSchemaAndHasAnyChanges(t *testing.T) {
